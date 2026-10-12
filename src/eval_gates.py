@@ -23,7 +23,7 @@ sys.path.insert(0, str(SRC))
 import torch
 
 from bimoe_model import BiMoE
-from mono_model import MonoNet, predict_next
+from mono_model import MonoNet, MonoFiLM, predict_next
 from losses import forward_kinematics_batch, joint_limit_loss
 from preprocess import parse_bvh
 
@@ -37,9 +37,13 @@ def load_all(weights_path):
     state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         print(f"Checkpoint: epoch {ckpt.get('epoch')} best {ckpt.get('best_val')}")
-    # Autodeteccion: keys con 'router' = MoE, si no = mono (1X).
+    # Autodeteccion: keys con 'router' = MoE, con 'film' = mono-FiLM, si no = mono (1X).
     arch = "moe" if any("router" in k for k in state.keys()) else "mono"
-    model = BiMoE() if arch == "moe" else MonoNet()
+    if arch == "mono" and any("film" in k for k in state.keys()):
+        model = MonoFiLM()
+        print("Variante detectada: FiLM (fase modula ocultas)")
+    else:
+        model = BiMoE() if arch == "moe" else MonoNet()
     model.load_state_dict(state)
     model.eval()
     print(f"Arquitectura detectada: {arch}")

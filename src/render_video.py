@@ -20,7 +20,7 @@ from matplotlib.animation import FFMpegWriter
 import torch
 
 from bimoe_model import BiMoE
-from mono_model import MonoNet, predict_next
+from mono_model import MonoNet, MonoFiLM, predict_next
 from losses import forward_kinematics_batch
 from preprocess import parse_bvh
 
@@ -36,9 +36,9 @@ def main():
     state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         print(f"Checkpoint: epoch {ckpt.get('epoch')} best {ckpt.get('best_val')}")
-    # Autodeteccion: keys con 'router' = MoE, si no = mono (misma regla que eval_gates).
+    # Autodeteccion: keys con 'router' = MoE, con 'film' = mono-FiLM, si no = mono (misma regla que eval_gates).
     arch = "moe" if any("router" in k for k in state.keys()) else "mono"
-    model = BiMoE() if arch == "moe" else MonoNet()
+    model = BiMoE() if arch == "moe" else (MonoFiLM() if any("film" in k for k in state.keys()) else MonoNet())
     model.load_state_dict(state)
     model.eval()
     print(f"Arquitectura detectada: {arch}")

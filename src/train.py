@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from bimoe_model import BiMoE
-from mono_model import MonoNet, predict_next
+from mono_model import MonoNet, MonoFiLM, predict_next
 from losses import (assemble_prediction, foot_contact_loss, foot_sliding_loss,
                     joint_limit_loss, quaternion_sign_invariant_loss,
                     forward_kinematics_batch, total_loss)
@@ -299,8 +299,9 @@ def main():
     val_root_prev = (root_mean + targets[val_starts - 1][:, 92:95] * root_std)
     val_true_root = val_true[:, :, 92:95] * root_std + root_mean  # metros
 
-    model = (MonoNet() if args.arch == "mono" else BiMoE()).to(device)
-    prefix = "mono1x" if args.arch == "mono" else "bimoe10k"
+    model = (MonoFiLM() if (args.arch == "mono" and args.film) else
+             MonoNet() if args.arch == "mono" else BiMoE()).to(device)
+    prefix = "film1x" if (args.arch == "mono" and args.film) else "mono1x" if args.arch == "mono" else "bimoe10k"
     run_id = args.run_id or prefix
     print(f"Arquitectura: {args.arch} | Parametros: {model.count_parameters()}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -319,7 +320,7 @@ def main():
             print("Usa --resume <ckpt> para continuar o --fresh para reiniciar "
                   "(solo si cambias de arquitectura).")
             raise SystemExit(1)
-    config = {"arch": args.arch, "run_id": run_id, "unroll": args.unroll,
+    config = {"arch": args.arch, "film": args.film, "run_id": run_id, "unroll": args.unroll,
               "batch": args.batch, "noise": args.noise,
               "w_vel": args.w_vel, "w_contact": args.w_contact,
               "w_foot": args.w_foot, "w_limit": args.w_limit,
@@ -507,6 +508,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Entrena BiMoE-10K v3 (desenrollado)")
     parser.add_argument("--arch", default="moe", choices=["moe", "mono"],
                         help="moe = router+2 expertos (BiMoE), mono = una sola red (1X)")
+    parser.add_argument("--film", action="store_true",
+                        help="mono con fase que modula ocultas (vaso nuevo PFNN-barato; NO admite --resume de pesos mono, run fresco)")
     parser.add_argument("--data", default="data/locomotion.npz")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch", type=int, default=64)

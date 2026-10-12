@@ -34,6 +34,52 @@ class MonoNet(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class MonoFiLM(nn.Module):
+    """Mono + fase que MODULA la red (truco PFNN barato, sin 4x pesos).
+
+    La fase (ultimo float del estado, 0-1) genera gamma/beta por capa oculta:
+    h = ReLU(gamma * (W h + b) + beta). Init gamma=1/beta=0 = arranca como
+    MonoNet plana; aprende la modulacion solo si tiene senal.
+    Mismo input (285) y output (95) que MonoNet; predict_next intacto.
+    Vaso NUEVO: no admite --resume de pesos mono (formas distintas)."""
+
+    FILM_HIDDEN = 32
+
+    def __init__(self, hidden=HIDDEN):
+        super().__init__()
+        self.hidden = hidden
+        self.fc1 = nn.Linear(INPUT_SIZE, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, OUTPUT_SIZE)
+        self.relu = nn.ReLU()
+        self.film = nn.Sequential(
+            nn.Linear(2, self.FILM_HIDDEN), nn.ReLU(),
+            nn.Linear(self.FILM_HIDDEN, 4 * hidden),
+        )
+        # Init neutro: gamma=1, beta=0 (empieza como MLP plana).
+        with torch.no_grad():
+            self.film[-1].weight.zero_()
+            self.film[-1].bias.zero_()
+            self.film[-1].bias[:hidden] = 0.0      # beta1
+            self.film[-1].bias[hidden:2 * hidden] = 1.0  # gamma1
+            self.film[-1].bias[2 * hidden:3 * hidden] = 0.0  # beta2
+            self.film[-1].bias[3 * hidden:] = 1.0  # gamma2
+
+    def forward(self, state):
+        phase = state[:, -1:]
+        tau = phase * (2.0 * torch.pi)
+        emb = torch.cat([torch.sin(tau), torch.cos(tau)], dim=-1)
+        film = self.film(emb)
+        h = self.hidden
+        beta1, gamma1, beta2, gamma2 = film.split(h, dim=-1)
+        out = self.relu(gamma1 * self.fc1(state) + beta1)
+        out = self.relu(gamma2 * self.fc2(out) + beta2)
+        return self.fc3(out)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters())
+
+
 def predict_next(delta95, base_quats, base_root_raw, root_std):
     """delta95 (B,95) -> quats unitarios (B,23,4) + root en metros (B,3).
     Residual: siguiente = base + delta, quats renormalizados."""
