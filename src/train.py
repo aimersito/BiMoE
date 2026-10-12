@@ -316,6 +316,7 @@ def main():
               "full_bptt": args.full_bptt, "val_every": args.val_every,
               "min_epochs": args.min_epochs, "patience": args.patience}
     start_epoch, best_val = 0, float("inf")
+    best_saved = False  # este run_id solo tiene _best.pt si mejora al heredado
     if args.resume:
         start_epoch, best_val = load_resume(args.resume, model, optimizer, scheduler)
     log_dir = Path("logs")
@@ -469,6 +470,7 @@ def main():
         if do_val:
             if val_finite and val_loss < best_val:
                 best_val = val_loss
+                best_saved = True
                 patience_left = args.patience
                 save_checkpoint(out_dir / f"{run_id}_best.pt", epoch, model, optimizer,
                                 scheduler, best_val, config)
@@ -481,7 +483,11 @@ def main():
         if epoch % max(1, args.ckpt_every) == 0:
             save_checkpoint(out_dir / f"{run_id}_epoch{epoch}_pose{last['pose']:.4f}_foot{last['foot']:.4f}.pt",
                             epoch, model, optimizer, scheduler, best_val, config)
-    print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / f'{run_id}_best.pt'}")
+    if best_saved:
+        print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / f'{run_id}_best.pt'}")
+    else:
+        print(f"Sin mejora en este run (mejor heredado {best_val:.6f}): "
+              f"no hay {out_dir / f'{run_id}_best.pt'}; el mejor sigue en el ckpt de --resume")
 
 
 def parse_args():
