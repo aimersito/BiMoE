@@ -33,10 +33,14 @@ def load_all(weights_path):
     names, parents, offsets, _, _, frame_time = parse_bvh(
         ROOT / "dataset" / "additional_basic_locomotion_2.bvh")
     ckpt = torch.load(weights_path, map_location="cpu")
+    # Formato nuevo (dict con model_state_dict) o legacy (solo pesos).
+    state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        print(f"Checkpoint: epoch {ckpt.get('epoch')} best {ckpt.get('best_val')}")
     # Autodeteccion: keys con 'router' = MoE, si no = mono (1X).
-    arch = "moe" if any("router" in k for k in ckpt.keys()) else "mono"
+    arch = "moe" if any("router" in k for k in state.keys()) else "mono"
     model = BiMoE() if arch == "moe" else MonoNet()
-    model.load_state_dict(ckpt)
+    model.load_state_dict(state)
     model.eval()
     print(f"Arquitectura detectada: {arch}")
     stats = {k: torch.from_numpy(bundle[k].astype(np.float32))

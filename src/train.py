@@ -14,6 +14,8 @@ Se conserva: residual, sampling 0->0.5, root supervisado, BPTT truncado, clamps.
 Uso:  python3 src/train.py --data data/locomotion.npz --epochs 200 --unroll 8 --out weights/
 """
 import argparse
+import datetime
+import json
 import sys
 from pathlib import Path
 
@@ -40,6 +42,91 @@ def build_windows(targets, starts, steps):
     prev_idx = starts[:, None] - 1 + torch.arange(steps)[None, :]
     prev_true = targets[prev_idx][:, :, :92].reshape(-1, steps, 23, 4)
     return true_win, prev_true
+
+
+def save_checkpoint(path, epoch, model, optimizer, scheduler, best_val, config):
+    """Guarda checkpoint completo: pesos + optimizador + scheduler + config.
+    Sin esto no hay resume real (el optimizador fresco rompe la continuidad)."""
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+        "best_val": best_val,
+        "config": config,
+    }, path)
+
+
+def load_resume(path, model, optimizer, scheduler):
+    """Carga checkpoint nuevo (dict) o legacy (solo pesos, optimizador fresco)."""
+    ckpt = torch.load(path, map_location="cpu")
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if scheduler is not None and ckpt.get("scheduler_state_dict"):
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except Exception as e:
+                print(f"  [resume] scheduler no cargado ({e}), se sigue igual")
+        print(f"  [resume] {path} -> epoch {ckpt.get('epoch')} best {ckpt.get('best_val')}")
+        return int(ckpt.get("epoch", 0)), float(ckpt.get("best_val", float("inf")))
+    model.load_state_dict(ckpt)
+    print(f"  [resume] {path} -> pesos legacy (optimizador fresco, una sola vez)")
+    return 0, float("inf")
+
+
+def rollout_120f_metric(model, arch, tq_t, tr_np, phase_np, period, seeds,
+                        stats_d, offsets_d, parents, inf_idx, sup_idx, dt):
+    """Rollout game-like 120f liviano para el log: mediana de pies (m) en seeds.
+    Misma receta que eval_gates (historial propio, root con velocidad real,
+    fase determinista). Sin gradiente."""
+    rm, rs = stats_d["root_mean"], stats_d["root_std"]
+    vm, vs = stats_d["vel_mean"], stats_d["vel_std"]
+    fm, fs = stats_d["feet_mean"], stats_d["feet_std"]
+    true_vel = (tr_np[1:] - tr_np[:-1]) / dt
+    meds = []
+    with torch.no_grad():
+        for s in seeds:
+            hist = [tq_t[s].clone(), tq_t[s - 1].clone(), tq_t[s - 2].clone()]
+            root = tr_np[s].copy()
+            ph = float(phase_np[s + 3] % 1.0)
+            qs, rs_ = [], []
+            for _ in range(120):
+                vv = true_vel[min(s + len(qs), len(true_vel) - 1)]
+                root = root + vv * dt
+                root_t = torch.from_numpy(root).to(device=tq_t.device, dtype=torch.float32)
+                vel_t = torch.from_numpy(vv).to(device=tq_t.device, dtype=torch.float32)
+                pos = forward_kinematics_batch(hist[0].reshape(1, 23, 4),
+                                               root_t.reshape(1, 3), offsets_d, parents)
+                feet = torch.stack([torch.minimum(pos[0, 21], pos[0, 22]),
+                                    torch.minimum(pos[0, 17], pos[0, 18])])[:, 1]
+                state = torch.cat([x.reshape(-1) for x in hist] +
+                                  [(root_t - rm) / rs, (vel_t - vm) / vs,
+                                   (feet - fm) / fs,
+                                   torch.tensor([ph], device=tq_t.device)])
+                if arch == "mono":
+                    nxt, _ = predict_next(model(state.unsqueeze(0)),
+                                          hist[0].reshape(1, 23, 4),
+                                          root_t.reshape(1, 3), rs)
+                    nxt = nxt.reshape(23, 4)
+                else:
+                    lower, upper, _ = model(state)
+                    dd = torch.zeros(23, 4, device=tq_t.device)
+                    dd[inf_idx] = lower[:36].reshape(-1, 4)
+                    dd[sup_idx] = upper.reshape(-1, 4)
+                    nxt = hist[0] + dd
+                    nxt = nxt / nxt.norm(dim=-1, keepdim=True).clamp_min(1e-4)
+                hist = [nxt, hist[0], hist[1]]
+                ph = (ph + 1.0 / period) % 1.0
+                qs.append(nxt)
+                rs_.append(root.copy())
+            q = torch.stack(qs)
+            r = torch.from_numpy(np.array(rs_)).to(device=tq_t.device, dtype=torch.float32)
+            joints = forward_kinematics_batch(q, r, offsets_d, parents)
+            feet_h = torch.minimum(torch.minimum(joints[:, 21, 1], joints[:, 22, 1]),
+                                   torch.minimum(joints[:, 17, 1], joints[:, 18, 1]))
+            meds.append(float(feet_h.median().item()))
+    return float(sum(meds) / len(meds))
 
 
 def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win, offsets_t, parents,
@@ -182,20 +269,58 @@ def main():
 
     model = (MonoNet() if args.arch == "mono" else BiMoE()).to(device)
     prefix = "mono1x" if args.arch == "mono" else "bimoe10k"
+    run_id = args.run_id or prefix
     print(f"Arquitectura: {args.arch} | Parametros: {model.count_parameters()}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Metodologia un solo modelo: sin --resume ni --fresh y con checkpoints
+    # previos del mismo run_id -> abortar (preguntar antes de reiniciar).
+    if not args.resume and not args.fresh:
+        prev = sorted(out_dir.glob(f"{run_id}_*.pt"))
+        if prev:
+            print(f"ABORTO: hay {len(prev)} checkpoint(s) de '{run_id}' en {out_dir}:")
+            for p in prev[-5:]:
+                print(f"  - {p.name}")
+            print("Usa --resume <ckpt> para continuar o --fresh para reiniciar "
+                  "(solo si cambias de arquitectura).")
+            raise SystemExit(1)
+    config = {"arch": args.arch, "run_id": run_id, "unroll": args.unroll,
+              "batch": args.batch, "noise": args.noise,
+              "w_vel": args.w_vel, "w_contact": args.w_contact,
+              "w_foot": args.w_foot, "w_limit": args.w_limit,
+              "ss_end": args.ss_end, "ss_ramp": args.ss_ramp,
+              "full_bptt": args.full_bptt}
+    start_epoch, best_val = 0, float("inf")
+    if args.resume:
+        start_epoch, best_val = load_resume(args.resume, model, optimizer, scheduler)
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{run_id}_{datetime.date.today():%Y%m%d}.log"
+    with open(log_path, "a") as f:
+        f.write(f"# run {run_id} arch={args.arch} resume={args.resume or '-'} "
+                f"start_epoch={start_epoch} config={json.dumps(config)}\n")
+    print(f"Checkpoints -> {out_dir} | log -> {log_path} | resume desde epoch {start_epoch}")
     detach_carry = not args.full_bptt
     print(f"BPTT: {'completo (encadenado)' if args.full_bptt else 'truncado (estable)'}")
-    best_val = float("inf")
-    patience_left = 20
+    patience_left = args.patience
     dev = torch.device(device)
     off_d = offsets_t.to(dev)
+    # Tensores para el rollout 120f del log (game-like, velocidad real).
+    tq_all = torch.from_numpy(bundle["targets"][:, :92]).reshape(-1, 23, 4).float().to(dev)
+    tr_all = (torch.from_numpy(bundle["targets"][:, 92:95].astype(np.float32)).to(dev)
+              * root_std.to(dev) + root_mean.to(dev)).double().cpu().numpy()
+    phase_all = bundle["phase"].astype(np.float64)
+    stats_d = {"root_mean": root_mean.to(dev), "root_std": root_std.to(dev),
+               "vel_mean": vel_mean.to(dev), "vel_std": vel_std.to(dev),
+               "feet_mean": feet_mean.to(dev), "feet_std": feet_std.to(dev)}
+    n_targets = len(tq_all)
+    roll_seeds = [min(val_end + 10 + i * 80, n_targets - 130)
+                  for i in range(max(1, args.rollout_seeds))]
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         train_loss = 0.0
         # Scheduled sampling: rampa lineal 0 -> ss_end (estados propios utiles,
@@ -280,24 +405,39 @@ def main():
                                     off_d, parents,
                                     inferior_idx, superior_idx, root_mean.to(dev),
                                     root_std.to(dev), euler_min.to(dev), euler_max.to(dev))
-        print(f"epoch {epoch:3d} train {train_loss / len(train_loader):.6f} "
-              f"val_unroll {val_loss:.6f} (pose {v['pose'].item():.6f} "
-              f"root {v['root'].item():.6f} vel {v['vel'].item():.6f} "
-              f"contact {v['contact'].item():.6f} foot {v['foot'].item():.6f} "
-              f"limit {v['limit'].item():.6f}) ref1 {ref.item():.6f} p {p_pred:.2f}", flush=True)
+        # Rollout 120f liviano para el log (cada rollout_every epochs).
+        if epoch % max(1, args.rollout_every) == 0:
+            with torch.no_grad():
+                roll_feet = rollout_120f_metric(model, args.arch, tq_all, tr_all, phase_all,
+                                                phase_period, roll_seeds, stats_d,
+                                                off_d, parents, inferior_idx,
+                                                superior_idx, frame_time)
+        else:
+            roll_feet = float("nan")
+        line = (f"epoch {epoch:3d} train {train_loss / len(train_loader):.6f} "
+                f"val_unroll {val_loss:.6f} (pose {v['pose'].item():.6f} "
+                f"root {v['root'].item():.6f} vel {v['vel'].item():.6f} "
+                f"contact {v['contact'].item():.6f} foot {v['foot'].item():.6f} "
+                f"limit {v['limit'].item():.6f}) ref1 {ref.item():.6f} "
+                f"roll120_feet {roll_feet:.3f} p {p_pred:.2f}")
+        print(line, flush=True)
+        with open(log_path, "a") as f:
+            f.write(line + "\n")
 
         if val_finite and val_loss < best_val:
             best_val = val_loss
-            patience_left = 20
-            torch.save(model.state_dict(), out_dir / f"{prefix}_best.pt")
+            patience_left = args.patience
+            save_checkpoint(out_dir / f"{run_id}_best.pt", epoch, model, optimizer,
+                            scheduler, best_val, config)
         else:
             patience_left -= 1
             if patience_left == 0:
                 print("Early stopping.")
                 break
-        if epoch % 10 == 0:
-            torch.save(model.state_dict(), out_dir / f"{prefix}_epoch{epoch}.pt")
-    print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / f'{prefix}_best.pt'}")
+        if epoch % max(1, args.ckpt_every) == 0:
+            save_checkpoint(out_dir / f"{run_id}_epoch{epoch}_pose{v['pose'].item():.4f}_foot{v['foot'].item():.4f}.pt",
+                            epoch, model, optimizer, scheduler, best_val, config)
+    print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / f'{run_id}_best.pt'}")
 
 
 def parse_args():
@@ -326,6 +466,20 @@ def parse_args():
     parser.add_argument("--ss-ramp", type=int, default=60,
                         help="epocas para subir el sampling de 0 a ss-end")
     parser.add_argument("--out", default="weights")
+    parser.add_argument("--resume", default=None,
+                        help="checkpoint para continuar (pesos + optimizador)")
+    parser.add_argument("--fresh", action="store_true",
+                        help="reiniciar desde cero aunque haya checkpoints (solo cambio de arquitectura)")
+    parser.add_argument("--run-id", default=None,
+                        help="id del run para checkpoints/logs (default: mono1x/bimoe10k)")
+    parser.add_argument("--ckpt-every", type=int, default=5,
+                        help="cada cuantas epochs guarda checkpoint descriptivo")
+    parser.add_argument("--patience", type=int, default=10,
+                        help="early stopping: epochs sin mejorar val_unroll")
+    parser.add_argument("--rollout-every", type=int, default=1,
+                        help="cada cuantas epochs loguea rollout 120f")
+    parser.add_argument("--rollout-seeds", type=int, default=2,
+                        help="seeds del rollout 120f del log (liviano)")
     return parser.parse_args()
 
 
