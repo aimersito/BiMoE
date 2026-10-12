@@ -20,6 +20,7 @@ from matplotlib.animation import FFMpegWriter
 import torch
 
 from bimoe_model import BiMoE
+from mono_model import MonoNet, predict_next
 from losses import forward_kinematics_batch
 from preprocess import parse_bvh
 
@@ -30,9 +31,17 @@ def main():
     names, parents, offsets, _, _, frame_time = parse_bvh(
         ROOT / "dataset" / "additional_basic_locomotion_2.bvh")
     ft = float(frame_time)
-    model = BiMoE()
-    model.load_state_dict(torch.load(a.weights, map_location="cpu"))
+    ckpt = torch.load(a.weights, map_location="cpu")
+    # Formato nuevo (dict con model_state_dict) o legacy (solo pesos).
+    state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        print(f"Checkpoint: epoch {ckpt.get('epoch')} best {ckpt.get('best_val')}")
+    # Autodeteccion: keys con 'router' = MoE, si no = mono (misma regla que eval_gates).
+    arch = "moe" if any("router" in k for k in state.keys()) else "mono"
+    model = BiMoE() if arch == "moe" else MonoNet()
+    model.load_state_dict(state)
     model.eval()
+    print(f"Arquitectura detectada: {arch}")
     st = {k: torch.from_numpy(bundle[k].astype(np.float32))
           for k in ["root_mean", "root_std", "vel_mean", "vel_std", "feet_mean", "feet_std"]}
     rm, rs, vm, vs, fm, fs = st["root_mean"], st["root_std"], st["vel_mean"], st["vel_std"], st["feet_mean"], st["feet_std"]
@@ -62,12 +71,18 @@ def main():
             state = torch.cat([x.reshape(-1) for x in hist] +
                               [(root_t - rm) / rs, (vel_t - vm) / vs, (feet - fm) / fs,
                                torch.tensor([ph])])
-            lower, upper, _ = model(state)
-            d = torch.zeros(23, 4)
-            d[inf_idx] = lower[:36].reshape(-1, 4)
-            d[sup_idx] = upper.reshape(-1, 4)
-            nxt = hist[0] + d
-            nxt = nxt / nxt.norm(dim=-1, keepdim=True)
+            if arch == "mono":
+                nxt, _ = predict_next(model(state.unsqueeze(0)),
+                                      hist[0].reshape(1, 23, 4),
+                                      root_t.reshape(1, 3), rs)
+                nxt = nxt.reshape(23, 4)
+            else:
+                lower, upper, _ = model(state)
+                d = torch.zeros(23, 4)
+                d[inf_idx] = lower[:36].reshape(-1, 4)
+                d[sup_idx] = upper.reshape(-1, 4)
+                nxt = hist[0] + d
+                nxt = nxt / nxt.norm(dim=-1, keepdim=True).clamp_min(1e-4)
             hist = [nxt, hist[0], hist[1]]
             ph = (ph + 1.0 / period) % 1.0
             quats.append(nxt.numpy())
@@ -98,7 +113,7 @@ def main():
             ax.set_xlim(mid[0] - r, mid[0] + r)
             ax.set_ylim(mid[2] - r, mid[2] + r)
             ax.set_zlim(0, 1.9)
-            ax.set_title(f"BiMoE v4 rollout f{f}")
+            ax.set_title(f"BiMoE rollout f{f} ({arch})")
             ax.view_init(elev=12, azim=-60)
             writer.grab_frame()
     print(f"VIDEO-OK {out} ({out.stat().st_size/1024:.0f} KB)")
