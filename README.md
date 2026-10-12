@@ -14,7 +14,8 @@ Prueba con 1 clip de marcha (`additional_basic_locomotion_2.bvh`, 23 nodos,
 - `src/bimoe_model.py` — router + 2 expertos (salidas disjuntas concatenadas)
 - `src/losses.py` — fidelidad invariante al signo + foot sliding (FK) +
   suavidad + límites anatómicos
-- `src/train.py` — entreno con ruido gaussiano (robustez)
+- `src/train.py` — entreno desenrollado multi-paso (anti-congelamiento) +
+  motion loss + ruido gaussiano (robustez)
 - `src/infer.py` — rollout + exporta BVH
 - `src/play.py` — demo jugable GLFW/OpenGL (WASD)
 - `src/render.py`, `src/viewer.py` — video y visor Open3D
@@ -33,5 +34,5 @@ python3 -m venv --system-site-packages .venv
 
 ```bash
 git clone https://github.com/aimersito/BiMoE.git
-cd BiMoE && python3 src/train.py --data data/locomotion.npz --epochs 200
+cd BiMoE && python3 src/train.py --data data/locomotion.npz --epochs 200 --unroll 8
 ```

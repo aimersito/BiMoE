@@ -36,13 +36,17 @@ WALK_SPEED = None  # se mide del BVH al arrancar
 class GameState:
     """Estado del personaje: pose + raiz + velocidad + giro (yaw)."""
 
-    def __init__(self, quats, root):
+    def __init__(self, quats, root, prev_quats=None, prev2_quats=None,
+                 velocity=None, yaw=0.0):
         self.quats = quats                  # (23, 4) torch, frame t
-        self.prev_quats = quats.clone()     # frame t-1 (historial)
-        self.prev2_quats = quats.clone()    # frame t-2 (historial)
+        # Historial con frames reales consecutivos (no clones: el clon
+        # estatico es OOD y mete un transitorio que realimenta el error).
+        self.prev_quats = prev_quats.clone() if prev_quats is not None else quats.clone()
+        self.prev2_quats = prev2_quats.clone() if prev2_quats is not None else quats.clone()
         self.root = root.astype(np.float64)  # (3,) metros
-        self.yaw = 0.0
-        self.velocity = np.zeros(3)          # m/s mundo
+        self.yaw = yaw
+        # Velocidad inicial = velocidad real del seed (no cero: cero tambien es OOD).
+        self.velocity = np.array(velocity, dtype=np.float64) if velocity is not None else np.zeros(3)
         self.keys = set()
 
     def desired_velocity(self):
@@ -61,8 +65,10 @@ class GameState:
             self.yaw -= 1.8 * dt
 
 
-def build_state(game, vel_std, offsets_t, parents, root_mean, root_std, feet_mean, feet_std):
-    """Vector de entrada de 100 numeros desde el estado actual del juego."""
+def build_state(game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std, feet_mean, feet_std):
+    """Vector de entrada de 284 numeros desde el estado actual del juego.
+    OJO: vel y pies van NORMALIZADOS con las stats crudas del entreno,
+    igual que en training (antes se pasaban en crudo: bug OOD)."""
     with torch.no_grad():
         pos = forward_kinematics_batch(game.quats.reshape(1, 23, 4).float(),
                                        torch.from_numpy(game.root).float().reshape(1, 3),
@@ -75,12 +81,12 @@ def build_state(game, vel_std, offsets_t, parents, root_mean, root_std, feet_mea
                        game.prev_quats.reshape(-1).float(),
                        game.prev2_quats.reshape(-1).float(),
                        (root_t - root_mean) / root_std,
-                       vel_t / vel_std,
+                       (vel_t - vel_mean) / vel_std,
                        (feet - feet_mean) / feet_std])
     return state
 
 
-def model_step(model, game, vel_std, offsets_t, parents, root_mean, root_std,
+def model_step(model, game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std,
                feet_mean, feet_std, inferior_idx, superior_idx, dt):
     """Un frame: el teclado mueve la raiz, el modelo pone la pose."""
     game.step_turn(dt)
@@ -90,7 +96,7 @@ def model_step(model, game, vel_std, offsets_t, parents, root_mean, root_std,
         desired = game.desired_velocity()
         game.velocity += (desired - game.velocity) * min(1.0, 8.0 * dt)
     game.root += game.velocity * dt
-    state = build_state(game, vel_std, offsets_t, parents, root_mean, root_std,
+    state = build_state(game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std,
                         feet_mean, feet_std)
     with torch.no_grad():
         lower, upper, _ = model(state)
@@ -277,9 +283,11 @@ def main():
     superior_idx = sorted(set(int(j) for j in bundle["superior_joints"]))
     root_mean = torch.from_numpy(bundle["root_mean"].astype(np.float32))
     root_std = torch.from_numpy(bundle["root_std"].astype(np.float32))
-    feet_mean = inputs[:train_end, 282:284].mean(dim=0)
-    feet_std = inputs[:train_end, 282:284].std(dim=0) + 1e-8
-    vel_std = torch.ones(3)
+    # Stats CRUDAS (no las columnas ya normalizadas del npz).
+    vel_mean = torch.from_numpy(bundle["vel_mean"].astype(np.float32))
+    vel_std = torch.from_numpy(bundle["vel_std"].astype(np.float32))
+    feet_mean = torch.from_numpy(bundle["feet_mean"].astype(np.float32))
+    feet_std = torch.from_numpy(bundle["feet_std"].astype(np.float32))
 
     names, parents, offsets, _, motion, frame_time = parse_bvh(
         ROOT / "dataset" / "additional_basic_locomotion_2.bvh")
@@ -295,15 +303,24 @@ def main():
     model.load_state_dict(torch.load(ROOT / "weights" / "bimoe10k_best.pt", map_location="cpu"))
     model.eval()
 
+    # Seed con 3 frames reales consecutivos + velocidad/yaw reales del clip
+    # (targets[i] = frame i+3; seed=val_end -> frames seed, seed+1, seed+2).
     seed = int(bundle["val_end"])
-    seed_quats = torch.from_numpy(bundle["targets"][seed - 1, :92]).reshape(23, 4)
+    q_t = torch.from_numpy(bundle["targets"][seed - 1, :92]).reshape(23, 4).float()
+    q_t1 = torch.from_numpy(bundle["targets"][seed - 2, :92]).reshape(23, 4).float()
+    q_t2 = torch.from_numpy(bundle["targets"][seed - 3, :92]).reshape(23, 4).float()
     seed_root = bundle["root_mean"] + bundle["targets"][seed - 1, 92:95] * bundle["root_std"]
-    game = GameState(seed_quats.float(), np.array(seed_root, dtype=np.float64))
+    root_t1 = bundle["root_mean"] + bundle["targets"][seed - 2, 92:95] * bundle["root_std"]
+    seed_vel = (np.array(seed_root) - np.array(root_t1)) / frame_time
+    seed_yaw = float(np.arctan2(seed_vel[2], seed_vel[0]))
+    game = GameState(q_t, np.array(seed_root, dtype=np.float64),
+                     prev_quats=q_t1, prev2_quats=q_t2,
+                     velocity=seed_vel, yaw=seed_yaw)
 
     if args.smoke:
         game.keys.add("w")
         for _ in range(120):
-            model_step(model, game, vel_std, offsets_t, parents, root_mean, root_std,
+            model_step(model, game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std,
                        feet_mean, feet_std, inferior_idx, superior_idx, frame_time)
         assert torch.isfinite(game.quats).all(), "NaN en quats"
         norms = game.quats.norm(dim=-1)
@@ -315,7 +332,7 @@ def main():
     vista = Vista(game, parents, names)
 
     def tick(dt):
-        model_step(model, game, vel_std, offsets_t, parents, root_mean, root_std,
+        model_step(model, game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std,
                    feet_mean, feet_std, inferior_idx, superior_idx, dt)
         with torch.no_grad():
             pos = forward_kinematics_batch(game.quats.reshape(1, 23, 4).float(),

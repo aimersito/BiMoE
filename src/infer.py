@@ -39,10 +39,12 @@ def main():
         ROOT / "dataset" / "additional_basic_locomotion_2.bvh")
     offsets_t = torch.tensor(np.array(offsets), dtype=torch.float32)
 
-    feet_mean = inputs[:train_end, 282:284].mean(dim=0)
-    feet_std = inputs[:train_end, 282:284].std(dim=0) + 1e-8
-    vel_mean = inputs[:train_end, 279:282].mean(dim=0)
-    vel_std = inputs[:train_end, 279:282].std(dim=0) + 1e-8
+    # Stats CRUDAS del bundle (las columnas del npz ya van normalizadas:
+    # promediarlas daria ~0/~1 y alimentaria velocidad/pies en crudo: bug OOD).
+    feet_mean = torch.from_numpy(bundle["feet_mean"])
+    feet_std = torch.from_numpy(bundle["feet_std"])
+    vel_mean = torch.from_numpy(bundle["vel_mean"])
+    vel_std = torch.from_numpy(bundle["vel_std"])
 
     model = BiMoE()
     model.load_state_dict(torch.load(ROOT / "weights" / "bimoe10k_best.pt", map_location="cpu"))

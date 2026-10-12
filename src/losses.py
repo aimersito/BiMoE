@@ -87,20 +87,27 @@ def joint_limit_loss(pred_quats, euler_min, euler_max, margin=5.0):
     return (below.pow(2) + above.pow(2)).mean()
 
 
+def assemble_prediction(pred_lower, pred_upper, inferior_idx, superior_idx,
+                        root_mean, root_std, n_joints=23):
+    """Junta expertos -> quats unitarios (B,J,4) + root en metros (B,3)."""
+    batch = pred_lower.shape[0]
+    pred_quats = torch.zeros(batch, n_joints, 4, device=pred_lower.device,
+                             dtype=pred_lower.dtype)
+    pred_quats[:, inferior_idx] = pred_lower[:, :36].reshape(batch, 9, 4)
+    pred_quats[:, superior_idx] = pred_upper.reshape(batch, 14, 4)
+    pred_quats = functional.normalize(pred_quats, dim=-1)
+    pred_root = pred_lower[:, 36:39] * root_std + root_mean  # a metros para FK
+    return pred_quats, pred_root
+
+
 def total_loss(pred_lower, pred_upper, target, offsets, parents, inferior_idx, superior_idx,
                root_mean, root_std, euler_min, euler_max, ankle_idx=(17, 21), toe_idx=(18, 22),
                weight_pose=1.0, weight_foot=0.5, weight_smooth=0.3, weight_limit=0.5,
                weight_reg=1e-5, model=None):
     """Junta todo. target: (batch, 95) = 92 quats + 3 root."""
-    pred_quats = torch.zeros_like(target[:, :92].reshape(-1, 23, 4))
-    lower_quats = pred_lower[:, :36].reshape(-1, 9, 4)
-    upper_quats = pred_upper.reshape(-1, 14, 4)
-    pred_quats[:, inferior_idx] = lower_quats
-    pred_quats[:, superior_idx] = upper_quats
-    # Normaliza salida a quaterniones unitarios (estable + continuo).
-    pred_quats = functional.normalize(pred_quats, dim=-1)
+    pred_quats, pred_root = assemble_prediction(pred_lower, pred_upper, inferior_idx,
+                                               superior_idx, root_mean, root_std)
     target_quats = target[:, :92].reshape(-1, 23, 4)
-    pred_root = pred_lower[:, 36:39] * root_std + root_mean  # a metros para FK
     pose = quaternion_sign_invariant_loss(pred_quats, target_quats)
     foot = foot_sliding_loss(pred_quats, pred_root, offsets, parents, ankle_idx, toe_idx)
     smooth = smoothness_loss(pred_quats)

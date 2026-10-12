@@ -260,6 +260,8 @@ def main():
         superior_joints=np.array(SUPERIOR_JOINTS),
         euler_min=euler_min, euler_max=euler_max,
         root_mean=root_mean, root_std=root_std,
+        vel_mean=vel_mean, vel_std=vel_std,
+        feet_mean=feet_mean, feet_std=feet_std,
         frame_time=frame_time,
     )
     print(f"OK: {OUT_PATH}")
