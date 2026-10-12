@@ -6,7 +6,7 @@ Total ~10.435 parametros. Comentarios en espanol; variables en ingles.
 import torch
 import torch.nn as nn
 
-INPUT_SIZE = 284  # 92 quats x3 (t, t-1, t-2) + 3 root + 3 vel + 2 pies
+INPUT_SIZE = 285  # 92 quats x3 (t, t-1, t-2) + 3 root + 3 vel + 2 pies + 1 fase (v5)
 CONTEXT_SIZE = 8
 INFERIOR_OUT = 39  # 9 articulaciones x 4 + 3 root
 SUPERIOR_OUT = 56  # 14 articulaciones x 4

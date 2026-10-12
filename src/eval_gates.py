@@ -40,15 +40,20 @@ def load_all(weights_path):
     tq = torch.from_numpy(bundle["targets"][:, :92]).reshape(-1, 23, 4).float()
     tr = (torch.from_numpy(bundle["targets"][:, 92:95].astype(np.float32))
           * stats["root_std"] + stats["root_mean"]).numpy().astype(np.float64)
+    # Fase v5: targets[i] = frame i+3 del BVH.
+    phase = bundle["phase"].astype(np.float64)
+    period = float(bundle["phase_period"])
     return model, bundle, parents, torch.tensor(np.array(offsets), dtype=torch.float32), \
-        float(frame_time), stats, tq, tr
+        float(frame_time), stats, tq, tr, phase, period
 
 
-def rollout(model, tq, tr, seed_idx, steps, stats, offsets_t, parents, dt,
+def rollout(model, tq, tr, phase, period, seed_idx, steps, stats, offsets_t, parents, dt,
             inf_idx, sup_idx, true_vel_traj=True):
-    """Rollout game-like: historial propio, root integrado con velocidad REAL."""
+    """Rollout game-like: historial propio, root integrado con velocidad REAL.
+    v5: fase determinista (fase += 1/periodo por frame)."""
     hist = [tq[seed_idx].clone(), tq[seed_idx - 1].clone(), tq[seed_idx - 2].clone()]
     root = tr[seed_idx].copy()
+    ph = float(phase[seed_idx + 3] % 1.0)
     true_vel = (tr[1:] - tr[:-1]) / dt
     quats_out, roots_out = [], []
     rm, rs, vm, vs, fm, fs = (stats["root_mean"], stats["root_std"], stats["vel_mean"],
@@ -64,7 +69,8 @@ def rollout(model, tq, tr, seed_idx, steps, stats, offsets_t, parents, dt,
             feet = torch.stack([torch.minimum(pos[0, 21], pos[0, 22]),
                                 torch.minimum(pos[0, 17], pos[0, 18])])[:, 1]
             state = torch.cat([x.reshape(-1) for x in hist] +
-                              [(root_t - rm) / rs, (vel_t - vm) / vs, (feet - fm) / fs])
+                              [(root_t - rm) / rs, (vel_t - vm) / vs, (feet - fm) / fs,
+                               torch.tensor([ph])])
             lower, upper, _ = model(state)
             d = torch.zeros(23, 4)
             d[inf_idx] = lower[:36].reshape(-1, 4)
@@ -72,6 +78,7 @@ def rollout(model, tq, tr, seed_idx, steps, stats, offsets_t, parents, dt,
             nxt = hist[0] + d
             nxt = nxt / nxt.norm(dim=-1, keepdim=True)
             hist = [nxt, hist[0], hist[1]]
+            ph = (ph + 1.0 / period) % 1.0
             quats_out.append(nxt.numpy())
             roots_out.append(root.copy())
     return np.array(quats_out), np.array(roots_out)
@@ -81,13 +88,13 @@ def quat_mse(a, b):
     return np.minimum(((a - b) ** 2).sum(axis=-1), ((a + b) ** 2).sum(axis=-1)).mean()
 
 
-def gate_short(model, tq, tr, seeds, stats, offsets_t, parents, dt, inf_idx, sup_idx):
+def gate_short(model, tq, tr, phase, period, seeds, stats, offsets_t, parents, dt, inf_idx, sup_idx):
     print("== Puerta 1: modelo vs zero-velocity (menor es mejor) ==")
     ok = True
     for h in [5, 10, 20, 24]:
         m_errs, z_errs = [], []
         for s in seeds:
-            pred, _ = rollout(model, tq, tr, s, h, stats, offsets_t, parents,
+            pred, _ = rollout(model, tq, tr, phase, period, s, h, stats, offsets_t, parents,
                               dt, inf_idx, sup_idx)
             real = tq[s + 1:s + 1 + h].numpy()
             m_errs.append(quat_mse(pred, real[:len(pred)]))
@@ -102,12 +109,12 @@ def gate_short(model, tq, tr, seeds, stats, offsets_t, parents, dt, inf_idx, sup
     return ok
 
 
-def gate_rollout(model, tq, tr, seeds, stats, offsets_t, parents, dt, inf_idx, sup_idx):
+def gate_rollout(model, tq, tr, phase, period, seeds, stats, offsets_t, parents, dt, inf_idx, sup_idx):
     print("== Puerta 2: rollout 120f game-like ==")
     feet_all, jerks, lims, frozen = [], [], [], 0
     nat_jerk = float(np.abs(np.diff(tq.numpy(), axis=0)).mean())
     for s in seeds:
-        pred, roots = rollout(model, tq, tr, s, 120, stats, offsets_t, parents,
+        pred, roots = rollout(model, tq, tr, phase, period, s, 120, stats, offsets_t, parents,
                               dt, inf_idx, sup_idx)
         with torch.no_grad():
             pos = forward_kinematics_batch(torch.from_numpy(pred).float(),
@@ -136,15 +143,15 @@ def gate_rollout(model, tq, tr, seeds, stats, offsets_t, parents, dt, inf_idx, s
 
 def main():
     args = parse_args()
-    model, bundle, parents, offsets_t, dt, stats, tq, tr = load_all(args.weights)
+    model, bundle, parents, offsets_t, dt, stats, tq, tr, phase, period = load_all(args.weights)
     inf_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
     sup_idx = sorted(set(int(j) for j in bundle["superior_joints"]))
     va, n = int(bundle["val_end"]), len(tq)
     seeds = sorted(set(min(va + 10 + i * 80, n - 130) for i in range(8)))
     print(f"params: {model.count_parameters()} | seeds test: {seeds[0]}..{seeds[-1]}")
-    ok1 = gate_short(model, tq, tr, seeds, stats, offsets_t, parents, dt,
+    ok1 = gate_short(model, tq, tr, phase, period, seeds, stats, offsets_t, parents, dt,
                      inf_idx, sup_idx) if args.mode in ("all", "short") else True
-    ok2 = gate_rollout(model, tq, tr, seeds, stats, offsets_t, parents, dt,
+    ok2 = gate_rollout(model, tq, tr, phase, period, seeds, stats, offsets_t, parents, dt,
                        inf_idx, sup_idx) if args.mode in ("all", "rollout") else True
     print("RESULTADO:", "PASS (a entrenar/demo)" if (ok1 and ok2) else "FAIL (iterar)")
 

@@ -220,6 +220,44 @@ def main():
         foot_heights[frame, 1] = min(positions[ANKLE_RIGHT, 1], positions[TOE_RIGHT, 1])
     root_velocity = np.diff(root_position, axis=0, prepend=root_position[:1]) / frame_time
 
+    # Fase de marcha v5 (truco PFNN barato: 1 float 0-1).
+    # Senal = altura pie izq - pie der. Es debil (~4cm) y lenta (~0.65Hz),
+    # asi que primero pasa-banda alrededor del pico espectral y LUEGO Hilbert
+    # (Hilbert sobre banda ancha no rota: daba fase bimodal 0/0.5).
+    # Avance determinista: fase += 1/periodo por frame.
+    sig = (foot_heights[:, 0] - foot_heights[:, 1]).astype(np.float64)
+    sig = sig - sig.mean()
+    # NOTA: Hilbert via rfft+irfft NO funciona (irfft espeja el espectro y el
+    # resultado vuelve a ser real puro). Se usa FFT completa + ifft.
+    rspec = np.fft.rfft(sig)
+    rfreqs = np.fft.rfftfreq(len(sig), d=frame_time)
+    power = np.abs(rspec) * ((rfreqs > 0.4) & (rfreqs < 3.0))
+    f0 = rfreqs[int(np.argmax(power))]
+    X = np.fft.fft(sig)
+    freqs = np.fft.fftfreq(len(sig), d=frame_time)
+    keep = (np.abs(freqs - f0) < 0.25) | (np.abs(freqs + f0) < 0.25)
+    H = np.zeros(len(sig))
+    H[0] = 1.0
+    if len(sig) % 2 == 0:
+        H[1:len(sig) // 2] = 2.0
+        H[len(sig) // 2] = 1.0
+    else:
+        H[1:(len(sig) + 1) // 2] = 2.0
+    analytic = np.fft.ifft(X * keep * H)
+    phase = (np.angle(analytic) / (2.0 * np.pi)) % 1.0
+    unwrapped = np.unwrap(np.angle(analytic))
+    step = np.diff(unwrapped)
+    period = float(2.0 * np.pi / abs(step.mean())) if np.isfinite(step.mean()) and abs(step.mean()) > 1e-9 else 0.0
+    if not np.isfinite(period) or period < 8 or period > len(sig):
+        ac = np.correlate(sig, sig, mode="full")[len(sig) - 1:]
+        ac = ac / (ac[0] + 1e-12)
+        period = 48.0
+        for lag in range(10, 140):
+            if ac[lag] > ac[lag - 1] and ac[lag] > ac[lag + 1] and ac[lag] > 0.3:
+                period = float(lag)
+                break
+    print(f"Fase: f0 {f0:.2f} Hz, periodo {period:.1f} frames ({period * frame_time:.2f} s por zancada)")
+
     # Normalizacion: root y features con media/std; quaterniones quedan en [-1, 1].
     root_mean, root_std = root_position.mean(axis=0), root_position.std(axis=0) + 1e-8
     vel_mean, vel_std = root_velocity.mean(axis=0), root_velocity.std(axis=0) + 1e-8
@@ -238,10 +276,11 @@ def main():
     euler_max = euler_all.max(axis=0).astype(np.float32)
 
     # Pares con HISTORIAL: input[i] usa frames (f-1, f-2, f-3), target[i] es f.
-    # Entrada: 92*3 + 3 + 3 + 2 = 284. Salida: quats + root = 95.
+    # Entrada v5: 92*3 + 3 + 3 + 2 + 1 fase = 285. Salida: quats + root = 95.
     flat_quats = quaternions.reshape(data.shape[0], -1)
     inputs = np.concatenate([flat_quats[2:-1], flat_quats[1:-2], flat_quats[:-3],
-                             root_norm[2:-1], vel_norm[2:-1], feet_norm[2:-1]], axis=1)
+                             root_norm[2:-1], vel_norm[2:-1], feet_norm[2:-1],
+                             phase[2:-1, None]], axis=1)
     targets = np.concatenate([flat_quats[3:], root_norm[3:]], axis=1)
 
     # Split cronologico 80/10/10.
@@ -262,6 +301,7 @@ def main():
         root_mean=root_mean, root_std=root_std,
         vel_mean=vel_mean, vel_std=vel_std,
         feet_mean=feet_mean, feet_std=feet_std,
+        phase=phase.astype(np.float32), phase_period=np.float32(period),
         frame_time=frame_time,
     )
     print(f"OK: {OUT_PATH}")

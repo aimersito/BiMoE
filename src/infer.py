@@ -61,6 +61,9 @@ def main():
             torch.from_numpy(all_quats[seed - 3]).float()]
     current_root = all_root[seed - 1].copy()
     prev_root = all_root[seed - 2].copy()
+    phase_arr = bundle["phase"].astype(np.float64)
+    phase_period = float(bundle["phase_period"])
+    phase = float(phase_arr[seed + 2] % 1.0)  # targets[seed-1] = frame seed+2
     real_quats = all_quats[seed:seed + args.frames]
     real_root = all_root[seed:seed + args.frames]
 
@@ -77,7 +80,7 @@ def main():
             feet_n = (feet - feet_mean) / feet_std
             state = torch.cat([h.reshape(-1) for h in hist] +
                               [(root_t - torch.from_numpy(root_mean)) / torch.from_numpy(root_std),
-                               vel, feet_n])
+                               vel, feet_n, torch.tensor([phase])])
             lower, upper, _ = model(state)
             # v4 residual: next = base + delta (base = quats/root actuales).
             d = torch.zeros(23, 4)
@@ -88,6 +91,7 @@ def main():
             prev_root = current_root.copy()
             current_root = current_root + lower[36:39].numpy() * root_std
             hist = [full, hist[0], hist[1]]
+            phase = (phase + 1.0 / phase_period) % 1.0
             gen_quats.append(full.numpy())
             gen_root.append(current_root.copy())
 

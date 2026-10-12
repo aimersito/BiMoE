@@ -37,7 +37,7 @@ class GameState:
     """Estado del personaje: pose + raiz + velocidad + giro (yaw)."""
 
     def __init__(self, quats, root, prev_quats=None, prev2_quats=None,
-                 velocity=None, yaw=0.0):
+                 velocity=None, yaw=0.0, phase=0.0, phase_rate=0.0):
         self.quats = quats                  # (23, 4) torch, frame t
         # Historial con frames reales consecutivos (no clones: el clon
         # estatico es OOD y mete un transitorio que realimenta el error).
@@ -48,6 +48,8 @@ class GameState:
         # Velocidad inicial = velocidad real del seed (no cero: cero tambien es OOD).
         self.velocity = np.array(velocity, dtype=np.float64) if velocity is not None else np.zeros(3)
         self.keys = set()
+        self.phase = float(phase)        # v5: fase de marcha 0-1 (truco PFNN)
+        self.phase_rate = float(phase_rate)  # ciclos por segundo (1/periodo_s)
 
     def desired_velocity(self):
         forward = np.array([np.cos(self.yaw), 0.0, np.sin(self.yaw)])
@@ -66,7 +68,7 @@ class GameState:
 
 
 def build_state(game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std, feet_mean, feet_std):
-    """Vector de entrada de 284 numeros desde el estado actual del juego.
+    """Vector de entrada de 285 numeros desde el estado actual del juego.
     OJO: vel y pies van NORMALIZADOS con las stats crudas del entreno,
     igual que en training (antes se pasaban en crudo: bug OOD)."""
     with torch.no_grad():
@@ -82,7 +84,8 @@ def build_state(game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std
                        game.prev2_quats.reshape(-1).float(),
                        (root_t - root_mean) / root_std,
                        (vel_t - vel_mean) / vel_std,
-                       (feet - feet_mean) / feet_std])
+                       (feet - feet_mean) / feet_std,
+                       torch.tensor([game.phase])])
     return state
 
 
@@ -96,6 +99,7 @@ def model_step(model, game, vel_mean, vel_std, offsets_t, parents, root_mean, ro
         desired = game.desired_velocity()
         game.velocity += (desired - game.velocity) * min(1.0, 8.0 * dt)
     game.root += game.velocity * dt
+    game.phase = (game.phase + dt * game.phase_rate) % 1.0  # v5: fase determinista
     state = build_state(game, vel_mean, vel_std, offsets_t, parents, root_mean, root_std,
                         feet_mean, feet_std)
     with torch.no_grad():
@@ -315,9 +319,12 @@ def main():
     root_t1 = bundle["root_mean"] + bundle["targets"][seed - 2, 92:95] * bundle["root_std"]
     seed_vel = (np.array(seed_root) - np.array(root_t1)) / frame_time
     seed_yaw = float(np.arctan2(seed_vel[2], seed_vel[0]))
+    phase_period = float(bundle["phase_period"])
+    seed_phase = float(bundle["phase"][seed + 2] % 1.0)  # targets[seed-1] = frame seed+2
     game = GameState(q_t, np.array(seed_root, dtype=np.float64),
                      prev_quats=q_t1, prev2_quats=q_t2,
-                     velocity=seed_vel, yaw=seed_yaw)
+                     velocity=seed_vel, yaw=seed_yaw,
+                     phase=seed_phase, phase_rate=1.0 / (phase_period * frame_time))
 
     if args.smoke:
         game.keys.add("w")

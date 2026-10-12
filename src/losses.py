@@ -56,6 +56,17 @@ def foot_sliding_loss(pred_quats, pred_root, offsets, parents, ankle_idx, toe_id
     return (movement * contact_pairs.float()).sum() / contact_pairs.sum()
 
 
+def foot_contact_loss(pred_feet_seq, contact_mask):
+    """v5: pies ETIQUETADOS en contacto deben quedarse quietos.
+    pred_feet_seq: (B,K,2,3) con gradiente. contact_mask: (B,K-1,2) bool
+    (etiqueta del frame k: altura<0.10m AND velocidad<0.15m/s, estándar Kimodo).
+    Castiga desplazamiento horizontal del pie en contacto (HuMoR/MDM)."""
+    movement = torch.diff(pred_feet_seq[:, :, :, [0, 2]], dim=1).pow(2).sum(dim=-1)
+    if contact_mask.sum() == 0:
+        return movement.mean() * 0.0
+    return (movement * contact_mask.float()).sum() / contact_mask.float().sum()
+
+
 def smoothness_loss(pred_quats):
     """Penaliza cambios bruscos de velocidad angular entre frames."""
     velocity = torch.diff(pred_quats, dim=0)
@@ -113,10 +124,11 @@ def assemble_prediction(pred_lower, pred_upper, base_quats, base_root_raw,
 
 def total_loss(pred_lower, pred_upper, base, target, offsets, parents, inferior_idx, superior_idx,
                root_mean, root_std, euler_min, euler_max, ankle_idx=(17, 21), toe_idx=(18, 22),
-               weight_pose=1.0, weight_foot=0.5, weight_smooth=0.3, weight_limit=0.5,
+               weight_pose=1.0, weight_foot=0.5, weight_smooth=0.3, weight_limit=0.15,
                weight_root=1.0, weight_reg=1e-5, model=None):
     """Junta todo. base/target: (batch, 95) = 92 quats + 3 root_norm.
-    v4: salidas residuales; base = estado previo (quats + root_norm)."""
+    v4: salidas residuales; base = estado previo (quats + root_norm).
+    v5: limite 0.5->0.15 (a 16k params el auxiliar ahogaba a pose: era 29%)."""
     base_quats = base[:, :92].reshape(-1, 23, 4)
     base_root_raw = base[:, 92:95] * root_std + root_mean
     pred_quats, pred_root, _ = assemble_prediction(pred_lower, pred_upper, base_quats,

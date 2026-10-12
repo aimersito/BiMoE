@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Entrenamiento BiMoE-10K v4: residual + scheduled sampling + root supervisado.
+"""Entrenamiento BiMoE-10K v5: velocity lineal + contact + fase + limite 0.15.
 
-v4 ataca el atractor congelado medido (jerk≈0 autoalimentado):
-1. Salidas RESIDUALES (next = cur + delta): la salida constante deja de ser
-   minimo trivial y la motion loss la castiga directo.
-2. SCHEDULED SAMPLING con rampa 0->0.5: expone a estados propios utiles
-   (100% self-fed desde epoca 1 alimentaba basura: pose 0.35).
-3. ROOT con supervision directa (antes solo aprendia via FK).
-4. Se conserva: BPTT truncado, clamps fisicos, guards NaN (0 skips en v3).
+v5 ataca los 3 numeros rojos medidos con v4-ep20 (pies 0.28m, limite 0.115,
+error x7 en 24f) con trucos de la literatura, sin reinventar:
+1. VELOCITY LINEAL MSE(delta_pred, delta_gt) 0.2 (siMLPe/Back-to-MLP):
+   reemplaza al log1p (sin evidencia para velocidad de joints; amplifica ruido).
+2. CONTACT 0.5 con auto-label GT (altura<0.10m AND vel<0.15m/s, Kimodo) sobre
+   pies predichos (HuMoR/MDM). Ataca pies flotantes directo.
+3. FASE como input (1 float, truco PFNN barato): avance determinista.
+4. LIMITE 0.5->0.15: a 16k params el auxiliar ahogaba a pose (era 29% del total).
+Se conserva: residual, sampling 0->0.5, root supervisado, BPTT truncado, clamps.
 
 Uso:  python3 src/train.py --data data/locomotion.npz --epochs 200 --unroll 8 --out weights/
 """
@@ -24,7 +26,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from bimoe_model import BiMoE
-from losses import (assemble_prediction, foot_sliding_loss,
+from losses import (assemble_prediction, foot_contact_loss, foot_sliding_loss,
                     joint_limit_loss, quaternion_sign_invariant_loss,
                     forward_kinematics_batch, total_loss)
 from preprocess import parse_bvh
@@ -41,11 +43,17 @@ def build_windows(targets, starts, steps):
 
 def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win, offsets_t, parents,
            inferior_idx, superior_idx, root_mean, root_std, vel_mean, vel_std,
-           feet_mean, feet_std, euler_min, euler_max, frame_time, w_motion,
+           feet_mean, feet_std, euler_min, euler_max, frame_time, phase_period,
+           w_vel=0.2, w_contact=0.5, w_foot=0.5, w_limit=0.15,
            p_pred=1.0, detach_carry=True):
-    """Desenrolla K pasos. v4: salidas RESIDUALES + SCHEDULED SAMPLING.
-    p_pred = prob. de realimentar la prediccion propia (1-p = frame real GT).
-    Rampa 0->~0.5 por epoca: al inicio estados propios serian basura.
+    """Desenrolla K pasos. v5 = v4 + velocity lineal + contact + fase + limite 0.15.
+    - VELOCITY LINEAL MSE(delta_pred, delta_gt) 0.2: reemplaza al log1p (el log1p
+      amplifica ruido en trote; sin evidencia publicada para velocidad de joints).
+    - CONTACT 0.5: etiquetas del GT (altura<0.10m AND vel<0.15m/s, Kimodo) sobre
+      pies predichos (HuMoR/MDM). Ataca pies flotantes directo.
+    - FASE: input 285, avance determinista fase += 1/periodo (truco PFNN barato).
+    - LIMITE 0.15: a 16k params el 0.5 ahogaba a pose (29% del total).
+    p_pred = prob. de realimentar la prediccion propia (rampa por epoca).
     detach_carry=True = BPTT truncado (estable, bendecido por pushforward trick).
     true_root_win: (B,K,3) raices reales en metros (para sampling + loss root)."""
     n_joints = 23
@@ -55,9 +63,19 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
     root_sum = 0.0
     foot_sum = 0.0
     limit_sum = 0.0
-    motion_sum = 0.0
+    vel_sum = 0.0
     stacked = []
+    pred_feet = []
     steps = true_win.shape[1]
+    # Etiquetas de contacto desde el GT (sin gradiente): una sola FK del window.
+    with torch.no_grad():
+        true_pos = forward_kinematics_batch(true_win[:, :, :92].reshape(-1, steps, n_joints, 4).reshape(-1, n_joints, 4),
+                                            true_root_win.reshape(-1, 3), offsets_t, parents)
+        true_pos = true_pos.reshape(-1, steps, n_joints, 3)
+        true_feet = torch.stack([torch.minimum(true_pos[:, :, 21], true_pos[:, :, 22]),
+                                 torch.minimum(true_pos[:, :, 17], true_pos[:, :, 18])], dim=2)
+        true_speed = torch.diff(true_feet[:, :, :, [0, 2]], dim=1).norm(dim=-1) / frame_time
+        contact_mask = (true_feet[:, 1:, :, 1] < 0.10) & (true_speed < 0.15)  # (B,K-1,2)
     for k in range(steps):
         h0 = state[:, :92].reshape(-1, n_joints, 4)
         lower, upper, _ = model(state)
@@ -71,11 +89,14 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
         foot_sum = foot_sum + foot_sliding_loss(full, root_raw, offsets_t, parents,
                                                      (17, 21), (18, 22))
         limit_sum = limit_sum + joint_limit_loss(full, euler_min, euler_max)
-        # Motion sobre deltas CRUDOS (el modelo ya es residual: delta directo).
+        # Velocity LINEAL sobre deltas (v5): MSE directo, sin log1p ni denominador.
         true_delta = true_full - prev_true_win[:, k]
-        denom = true_delta.pow(2).mean().detach() + 1e-8
-        motion_sum = motion_sum + torch.log1p((delta - true_delta).pow(2).mean() / denom)
+        vel_sum = vel_sum + ((full - h0) - true_delta).pow(2).mean()
         stacked.append(full)
+        # Pies predichos para contact (con gradiente; FK propia del paso).
+        pos_pred = forward_kinematics_batch(full, root_raw, offsets_t, parents)
+        pred_feet.append(torch.stack([torch.minimum(pos_pred[:, 21], pos_pred[:, 22]),
+                                      torch.minimum(pos_pred[:, 17], pos_pred[:, 18])], dim=1))
         # Scheduled sampling: carry = mezcla propia/real segun p_pred.
         batch = state.shape[0]
         use_pred = (torch.rand(batch, 1, 1, device=state.device) < p_pred)
@@ -93,8 +114,10 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
         vel_raw = torch.clamp((root_raw_c - root_prev) / frame_time, -6.0, 6.0)
         vel_n = (vel_raw - vel_mean) / vel_std
         feet_n = (feet_raw_c - feet_mean) / feet_std
+        # Fase determinista (no se predice): avanza 1/periodo por frame.
+        phase_next = (state[:, -1:] + 1.0 / phase_period) % 1.0
         state = torch.cat([carry_q.reshape(batch, -1),
-                           state[:, :184], root_n, vel_n, feet_n], dim=1)
+                           state[:, :184], root_n, vel_n, feet_n, phase_next], dim=1)
         root_prev = root_raw_c
         if detach_carry:
             state = state.detach()
@@ -106,22 +129,30 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
         smooth = torch.diff(vel, dim=1).pow(2).mean()
     else:
         smooth = stacked.sum() * 0.0
+    # Contact sobre pies predichos apilados (con gradiente) + etiquetas GT.
+    pred_feet_seq = torch.stack(pred_feet, dim=1)  # (B, K, 2, 3)
+    if steps >= 2:
+        contact = foot_contact_loss(pred_feet_seq, contact_mask)
+    else:
+        contact = pred_feet_seq.sum() * 0.0
     n = float(steps)
     return {"pose": pose_sum / n, "root": root_sum / n, "foot": foot_sum / n,
-            "limit": limit_sum / n, "motion": motion_sum / n, "smooth": smooth,
-            "stacked": stacked}
+            "limit": limit_sum / n, "vel": vel_sum / n, "contact": contact,
+            "smooth": smooth, "stacked": stacked}
 
 
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Dispositivo: {device} | unroll: {args.unroll} | w_motion: {args.w_motion}")
+    print(f"Dispositivo: {device} | unroll: {args.unroll} | vel: {args.w_vel} "
+          f"contact: {args.w_contact} limit: {args.w_limit}")
 
     bundle = np.load(args.data)
     inputs = torch.from_numpy(bundle["inputs"])
     targets = torch.from_numpy(bundle["targets"])
     train_end, val_end = int(bundle["train_end"]), int(bundle["val_end"])
     frame_time = float(bundle["frame_time"])
+    phase_period = float(bundle["phase_period"])
     inferior_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
     superior_idx = sorted(set(int(j) for j in bundle["superior_joints"]))
     root_mean = torch.from_numpy(bundle["root_mean"].astype(np.float32))
@@ -179,18 +210,22 @@ def main():
                          off_d, parents,
                          inferior_idx, superior_idx, root_mean.to(dev), root_std.to(dev),
                          vel_mean.to(dev), vel_std.to(dev), feet_mean.to(dev), feet_std.to(dev),
-                         euler_min.to(dev), euler_max.to(dev), frame_time, args.w_motion,
+                         euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
+                         w_vel=args.w_vel, w_contact=args.w_contact,
+                         w_foot=args.w_foot, w_limit=args.w_limit,
                          p_pred=p_pred, detach_carry=detach_carry)
             reg = sum(p.pow(2).sum() for p in model.parameters())
-            loss = (out["pose"] + out["root"] + 0.5 * out["foot"] + 0.3 * out["smooth"]
-                    + 0.5 * out["limit"] + args.w_motion * out["motion"] + 1e-5 * reg)
+            loss = (out["pose"] + out["root"] + args.w_foot * out["foot"]
+                    + 0.3 * out["smooth"] + args.w_limit * out["limit"]
+                    + args.w_vel * out["vel"] + args.w_contact * out["contact"]
+                    + 1e-5 * reg)
             if not torch.isfinite(loss):
                 with torch.no_grad():
                     diag = {k: (v.item() if torch.is_tensor(v) else v)
                             for k, v in {"pose": out["pose"], "root": out["root"],
-                                         "foot": out["foot"],
+                                         "foot": out["foot"], "contact": out["contact"],
                                          "smooth": out["smooth"], "limit": out["limit"],
-                                         "motion": out["motion"]}.items()}
+                                         "vel": out["vel"]}.items()}
                 print(f"  [epoch {epoch}] batch no-finito: {diag}", flush=True)
                 optimizer.zero_grad()
                 continue
@@ -216,10 +251,13 @@ def main():
                        off_d, parents,
                        inferior_idx, superior_idx, root_mean.to(dev), root_std.to(dev),
                        vel_mean.to(dev), vel_std.to(dev), feet_mean.to(dev), feet_std.to(dev),
-                       euler_min.to(dev), euler_max.to(dev), frame_time, args.w_motion,
+                       euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
+                       w_vel=args.w_vel, w_contact=args.w_contact,
+                       w_foot=args.w_foot, w_limit=args.w_limit,
                        p_pred=args.ss_end)
-            val_tensor = (v["pose"] + v["root"] + 0.5 * v["foot"] + 0.5 * v["limit"]
-                          + args.w_motion * v["motion"])
+            val_tensor = (v["pose"] + v["root"] + args.w_foot * v["foot"]
+                          + args.w_limit * v["limit"] + args.w_vel * v["vel"]
+                          + args.w_contact * v["contact"])
             val_finite = bool(torch.isfinite(val_tensor).item())
             val_loss = val_tensor.item() if val_finite else float("nan")
             # Referencia one-step clasica sobre pares de val (base real -> target).
@@ -230,8 +268,8 @@ def main():
                                 root_std.to(dev), euler_min.to(dev), euler_max.to(dev))
         print(f"epoch {epoch:3d} train {train_loss / len(train_loader):.6f} "
               f"val_unroll {val_loss:.6f} (pose {v['pose'].item():.6f} "
-              f"root {v['root'].item():.6f} motion {v['motion'].item():.6f} "
-              f"foot {v['foot'].item():.6f} "
+              f"root {v['root'].item():.6f} vel {v['vel'].item():.6f} "
+              f"contact {v['contact'].item():.6f} foot {v['foot'].item():.6f} "
               f"limit {v['limit'].item():.6f}) ref1 {ref.item():.6f} p {p_pred:.2f}", flush=True)
 
         if val_finite and val_loss < best_val:
@@ -259,8 +297,14 @@ def parse_args():
                         help="pasos autoalimentados por batch (anti-congelamiento)")
     parser.add_argument("--full-bptt", action="store_true",
                         help="gradiente encadenado entre pasos (por defecto: truncado)")
-    parser.add_argument("--w_motion", type=float, default=0.15,
-                        help="peso motion (guia sin ahogar a pose; v3 usaba 0.5)")
+    parser.add_argument("--w_vel", type=float, default=0.2,
+                        help="peso velocity lineal MSE(deltas) (v5; reemplaza log1p)")
+    parser.add_argument("--w_contact", type=float, default=0.5,
+                        help="peso contact con etiquetas GT altura+vel (v5)")
+    parser.add_argument("--w_foot", type=float, default=0.5,
+                        help="peso foot sliding")
+    parser.add_argument("--w_limit", type=float, default=0.15,
+                        help="peso limite anatomico (v5: 0.5 ahogaba a pose)")
     parser.add_argument("--ss-end", type=float, default=0.5,
                         help="scheduled sampling final: prob. de realimentar prediccion")
     parser.add_argument("--ss-ramp", type=int, default=60,
