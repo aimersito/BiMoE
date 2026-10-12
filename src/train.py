@@ -242,10 +242,6 @@ def main():
     inputs = torch.from_numpy(bundle["inputs"])
     targets = torch.from_numpy(bundle["targets"])
     train_end, val_end = int(bundle["train_end"]), int(bundle["val_end"])
-    # Datos chicos (~8 MB): a GPU una sola vez, se acaban las transferencias por batch.
-    if device == "cuda":
-        inputs = inputs.cuda()
-        targets = targets.cuda()
     frame_time = float(bundle["frame_time"])
     phase_period = float(bundle["phase_period"])
     inferior_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
@@ -258,6 +254,14 @@ def main():
     feet_std = torch.from_numpy(bundle["feet_std"].astype(np.float32))
     euler_min = torch.from_numpy(bundle["euler_min"])
     euler_max = torch.from_numpy(bundle["euler_max"])
+    # Datos + stats chicos (~8 MB): a GPU una sola vez, cero transferencias por batch.
+    # (Todo junto aqui: inputs/targets se usan con las stats en la misma expresion.)
+    if device == "cuda":
+        inputs, targets = inputs.cuda(), targets.cuda()
+        root_mean, root_std = root_mean.cuda(), root_std.cuda()
+        vel_mean, vel_std = vel_mean.cuda(), vel_std.cuda()
+        feet_mean, feet_std = feet_mean.cuda(), feet_std.cuda()
+        euler_min, euler_max = euler_min.cuda(), euler_max.cuda()
 
     names, parents, offsets, _, _, _ = parse_bvh(SRC.parent / "dataset" / "additional_basic_locomotion_2.bvh")
     offsets_t = torch.tensor(np.array(offsets), dtype=torch.float32)
