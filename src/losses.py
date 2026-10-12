@@ -47,7 +47,9 @@ def foot_sliding_loss(pred_quats, pred_root, offsets, parents, ankle_idx, toe_id
     ], dim=1)  # (batch, 2, 3)
     heights = feet[:, :, 1]
     contact = heights < (heights.min() + threshold)
-    movement = torch.diff(feet[:, :, [0, 2]], dim=0).pow(2).sum(dim=-1).sqrt()
+    # eps dentro del sqrt: con salidas (casi) constantes los diffs son EXACTOS
+    # a 0 y el backward de sqrt da 0/0=NaN (forward finito). Escala intacta.
+    movement = torch.sqrt(torch.diff(feet[:, :, [0, 2]], dim=0).pow(2).sum(dim=-1) + 1e-8)
     contact_pairs = contact[:-1] & contact[1:]
     if contact_pairs.sum() == 0:
         return movement.mean() * 0.0
@@ -70,7 +72,7 @@ def quaternion_to_euler_yxz(quaternions):
     m11 = 1 - 2 * (x * x + z * z)
     m12 = 2 * (y * z - x * w)
     m22 = 1 - 2 * (x * x + y * y)
-    ex = torch.asin(torch.clamp(-m12, -1.0, 1.0))
+    ex = torch.asin(torch.clamp(-m12, -1.0 + 1e-6, 1.0 - 1e-6))
     ey = torch.atan2(m02, m22)
     ez = torch.atan2(m10, m11)
     return torch.stack([ey, ex, ez], dim=-1) * (180.0 / 3.141592653589793)
@@ -87,33 +89,49 @@ def joint_limit_loss(pred_quats, euler_min, euler_max, margin=5.0):
     return (below.pow(2) + above.pow(2)).mean()
 
 
-def assemble_prediction(pred_lower, pred_upper, inferior_idx, superior_idx,
-                        root_mean, root_std, n_joints=23):
-    """Junta expertos -> quats unitarios (B,J,4) + root en metros (B,3)."""
+def assemble_prediction(pred_lower, pred_upper, base_quats, base_root_raw,
+                        inferior_idx, superior_idx, root_mean, root_std, n_joints=23):
+    """Junta expertos (RESIDUALES) -> quats unitarios (B,J,4) + root en metros (B,3).
+    v4: el modelo predice DELTAS, no pose absoluta (rompe el atractor de punto fijo).
+      full = norm(base + delta_quats); root = base_root + delta_root*root_std."""
     batch = pred_lower.shape[0]
-    pred_quats = torch.zeros(batch, n_joints, 4, device=pred_lower.device,
-                             dtype=pred_lower.dtype)
-    pred_quats[:, inferior_idx] = pred_lower[:, :36].reshape(batch, 9, 4)
-    pred_quats[:, superior_idx] = pred_upper.reshape(batch, 14, 4)
-    pred_quats = functional.normalize(pred_quats, dim=-1)
-    pred_root = pred_lower[:, 36:39] * root_std + root_mean  # a metros para FK
-    return pred_quats, pred_root
+    delta_quats = torch.zeros(batch, n_joints, 4, device=pred_lower.device,
+                              dtype=pred_lower.dtype)
+    delta_quats[:, inferior_idx] = pred_lower[:, :36].reshape(batch, 9, 4)
+    delta_quats[:, superior_idx] = pred_upper.reshape(batch, 14, 4)
+    # Residual: siguiente = base + delta, renormalizado a unitario.
+    pred_quats = base_quats + delta_quats
+    # Norma con piso: un vector cero exacto daria NaN al normalizar.
+    # Piso 1e-4 (no 1e-8): el backward escala con 1/norma y con 1e-8 un
+    # gradiente inf entra a clip_grad_norm_ (inf*0=NaN) y envenena los pesos.
+    norm = pred_quats.norm(dim=-1, keepdim=True).clamp_min(1e-4)
+    pred_quats = pred_quats / norm
+    # Delta de root en unidades normalizadas (escala ~unitaria como el resto).
+    pred_root = base_root_raw + pred_lower[:, 36:39] * root_std  # a metros para FK
+    return pred_quats, pred_root, delta_quats
 
 
-def total_loss(pred_lower, pred_upper, target, offsets, parents, inferior_idx, superior_idx,
+def total_loss(pred_lower, pred_upper, base, target, offsets, parents, inferior_idx, superior_idx,
                root_mean, root_std, euler_min, euler_max, ankle_idx=(17, 21), toe_idx=(18, 22),
                weight_pose=1.0, weight_foot=0.5, weight_smooth=0.3, weight_limit=0.5,
-               weight_reg=1e-5, model=None):
-    """Junta todo. target: (batch, 95) = 92 quats + 3 root."""
-    pred_quats, pred_root = assemble_prediction(pred_lower, pred_upper, inferior_idx,
-                                               superior_idx, root_mean, root_std)
+               weight_root=1.0, weight_reg=1e-5, model=None):
+    """Junta todo. base/target: (batch, 95) = 92 quats + 3 root_norm.
+    v4: salidas residuales; base = estado previo (quats + root_norm)."""
+    base_quats = base[:, :92].reshape(-1, 23, 4)
+    base_root_raw = base[:, 92:95] * root_std + root_mean
+    pred_quats, pred_root, _ = assemble_prediction(pred_lower, pred_upper, base_quats,
+                                                   base_root_raw, inferior_idx,
+                                                   superior_idx, root_mean, root_std)
     target_quats = target[:, :92].reshape(-1, 23, 4)
+    true_root_raw = target[:, 92:95] * root_std + root_mean
     pose = quaternion_sign_invariant_loss(pred_quats, target_quats)
+    # Root supervisado directo (antes solo aprendia via FK del foot loss).
+    root = (((pred_root - true_root_raw) / root_std).pow(2)).mean()
     foot = foot_sliding_loss(pred_quats, pred_root, offsets, parents, ankle_idx, toe_idx)
     smooth = smoothness_loss(pred_quats)
     limit = joint_limit_loss(pred_quats, euler_min, euler_max)
     reg = sum(p.pow(2).sum() for p in model.parameters()) if model is not None else 0.0
-    total = (weight_pose * pose + weight_foot * foot + weight_smooth * smooth
-             + weight_limit * limit + weight_reg * reg)
-    return total, {"pose": pose.detach(), "foot": foot.detach(),
+    total = (weight_pose * pose + weight_root * root + weight_foot * foot
+             + weight_smooth * smooth + weight_limit * limit + weight_reg * reg)
+    return total, {"pose": pose.detach(), "root": root.detach(), "foot": foot.detach(),
                    "smooth": smooth.detach(), "limit": limit.detach()}

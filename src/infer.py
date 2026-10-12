@@ -79,12 +79,14 @@ def main():
                               [(root_t - torch.from_numpy(root_mean)) / torch.from_numpy(root_std),
                                vel, feet_n])
             lower, upper, _ = model(state)
-            full = torch.zeros(23, 4)
-            full[inferior_idx] = lower[:36].reshape(-1, 4)
-            full[superior_idx] = upper.reshape(-1, 4)
+            # v4 residual: next = base + delta (base = quats/root actuales).
+            d = torch.zeros(23, 4)
+            d[inferior_idx] = lower[:36].reshape(-1, 4)
+            d[superior_idx] = upper.reshape(-1, 4)
+            full = hist[0] + d
             full = full / full.norm(dim=-1, keepdim=True)
             prev_root = current_root.copy()
-            current_root = lower[36:39].numpy() * root_std + root_mean
+            current_root = current_root + lower[36:39].numpy() * root_std
             hist = [full, hist[0], hist[1]]
             gen_quats.append(full.numpy())
             gen_root.append(current_root.copy())

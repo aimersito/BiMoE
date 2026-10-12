@@ -100,12 +100,14 @@ def model_step(model, game, vel_mean, vel_std, offsets_t, parents, root_mean, ro
                         feet_mean, feet_std)
     with torch.no_grad():
         lower, upper, _ = model(state)
-    full = torch.zeros(23, 4)
-    full[inferior_idx] = lower[:36].reshape(-1, 4)
-    full[superior_idx] = upper.reshape(-1, 4)
+    delta = torch.zeros(23, 4)
+    delta[inferior_idx] = lower[:36].reshape(-1, 4)
+    delta[superior_idx] = upper.reshape(-1, 4)
     game.prev2_quats = game.prev_quats
     game.prev_quats = game.quats
-    game.quats = full / full.norm(dim=-1, keepdim=True)
+    # v4 residual: next = base + delta.
+    nxt = game.quats + delta
+    game.quats = nxt / nxt.norm(dim=-1, keepdim=True)
 
 
 class Vista:
