@@ -157,6 +157,7 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
     foot_sum = 0.0
     limit_sum = 0.0
     vel_sum = 0.0
+    pose_steps = []  # error de pose por paso (para el correctivo leve)
     stacked = []
     pred_feet = []
     steps = true_win.shape[1]
@@ -180,7 +181,9 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
                                                     root_mean, root_std, n_joints)
         true_full = true_win[:, k, :92].reshape(-1, n_joints, 4)
         true_root = true_root_win[:, k]
-        pose_sum = pose_sum + quaternion_sign_invariant_loss(full, true_full)
+        pose_step = quaternion_sign_invariant_loss(full, true_full)
+        pose_sum = pose_sum + pose_step
+        pose_steps.append(pose_step)
         root_sum = root_sum + (((root_raw - true_root) / root_std).pow(2)).mean()
         foot_sum = foot_sum + foot_sliding_loss(full, root_raw, offsets_t, parents,
                                                      (17, 21), (18, 22))
@@ -219,8 +222,17 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
             state = state.detach()
             root_prev = root_prev.detach()
     stacked = torch.stack(stacked, dim=1)  # (B, K, J, 4)
-    # DVEL secuencial (siMLPe dloss): velocidad del movimiento predicho vs GT,
-    # independiente del carry. Solo existe con K>=2.
+    # L_CORR leve (correctivo estilo BAgger simplificado): castiga que el error de
+    # pose CREZCA de un paso al siguiente (derivar sin volver). Con BPTT truncado
+    # cada paso ya es contexto propio congelado; esto presiona a no derivar mas,
+    # o sea a volver o sostener. La version agresiva (segundo unroll desde el
+    # paso de deriva con loss solo en la vuelta) queda para despues si esta da senal.
+    if steps >= 2 and len(pose_steps) == steps:
+        esteps = torch.stack(pose_steps)
+        corr = torch.relu(esteps[1:] - esteps[:-1]).mean()
+    else:
+        corr = stacked.sum() * 0.0
+    # DVEL secuencial (siMLPe dloss, archivado: inerte a cualquier escala).
     gt_seq = true_win[:, :, :92].reshape(true_win.shape[0], steps, n_joints, 4)
     if steps >= 2:
         dvel = torch.diff(stacked, dim=1).sub(torch.diff(gt_seq, dim=1)).pow(2).mean()
@@ -241,7 +253,7 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
     n = float(steps)
     return {"pose": pose_sum / n, "root": root_sum / n, "foot": foot_sum / n,
             "limit": limit_sum / n, "vel": vel_sum / n, "contact": contact,
-            "smooth": smooth, "dvel": dvel, "stacked": stacked}
+            "smooth": smooth, "dvel": dvel, "corr": corr, "stacked": stacked}
 
 
 def main():
@@ -311,7 +323,7 @@ def main():
               "batch": args.batch, "noise": args.noise,
               "w_vel": args.w_vel, "w_contact": args.w_contact,
               "w_foot": args.w_foot, "w_limit": args.w_limit,
-              "w_dvel": args.w_dvel,
+              "w_dvel": args.w_dvel, "w_root": args.w_root, "w_corr": args.w_corr,
               "ss_end": args.ss_end, "ss_ramp": args.ss_ramp,
               "full_bptt": args.full_bptt, "val_every": args.val_every,
               "min_epochs": args.min_epochs, "patience": args.patience}
@@ -334,7 +346,7 @@ def main():
     last = {"val": float("nan"), "pose": float("nan"), "root": float("nan"),
             "vel": float("nan"), "contact": float("nan"), "foot": float("nan"),
             "limit": float("nan"), "ref": float("nan"), "roll": float("nan"),
-            "dvel": float("nan")}
+            "dvel": float("nan"), "corr": float("nan")}
     dev = torch.device(device)
     off_d = offsets_t.to(dev)
     # Tensores para el rollout 120f del log (game-like, velocidad real).
@@ -375,10 +387,10 @@ def main():
                          w_dvel=args.w_dvel,
                          p_pred=p_pred, detach_carry=detach_carry, arch=args.arch)
             reg = sum(p.pow(2).sum() for p in model.parameters())
-            loss = (out["pose"] + out["root"] + args.w_foot * out["foot"]
+            loss = (out["pose"] + args.w_root * out["root"] + args.w_foot * out["foot"]
                     + 0.3 * out["smooth"] + args.w_limit * out["limit"]
                     + args.w_vel * out["vel"] + args.w_contact * out["contact"]
-                    + args.w_dvel * out["dvel"]
+                    + args.w_dvel * out["dvel"] + args.w_corr * out["corr"]
                     + 1e-5 * reg)
             if not torch.isfinite(loss):
                 with torch.no_grad():
@@ -386,7 +398,7 @@ def main():
                             for k, v in {"pose": out["pose"], "root": out["root"],
                                          "foot": out["foot"], "contact": out["contact"],
                                          "smooth": out["smooth"], "limit": out["limit"],
-                                         "vel": out["vel"], "dvel": out["dvel"]}.items()}
+                                         "vel": out["vel"], "dvel": out["dvel"], "corr": out["corr"]}.items()}
                 print(f"  [epoch {epoch}] batch no-finito: {diag}", flush=True)
                 optimizer.zero_grad()
                 continue
@@ -421,10 +433,10 @@ def main():
                            w_foot=args.w_foot, w_limit=args.w_limit,
                            w_dvel=args.w_dvel,
                            p_pred=args.ss_end, arch=args.arch)
-                val_tensor = (v["pose"] + v["root"] + args.w_foot * v["foot"]
+                val_tensor = (v["pose"] + args.w_root * v["root"] + args.w_foot * v["foot"]
                               + args.w_limit * v["limit"] + args.w_vel * v["vel"]
                               + args.w_contact * v["contact"]
-                              + args.w_dvel * v["dvel"])
+                              + args.w_dvel * v["dvel"] + args.w_corr * v["corr"])
                 val_finite = bool(torch.isfinite(val_tensor).item())
                 val_loss = val_tensor.item() if val_finite else float("nan")
                 # Referencia one-step clasica sobre pares de val (base real -> target).
@@ -447,7 +459,7 @@ def main():
                                  "root": v["root"].item(), "vel": v["vel"].item(),
                                  "contact": v["contact"].item(), "foot": v["foot"].item(),
                                  "limit": v["limit"].item(), "ref": ref.item(),
-                                 "dvel": v["dvel"].item()})
+                                 "dvel": v["dvel"].item(), "corr": v["corr"].item()})
             # Rollout 120f liviano para el log (solo en epochs de val).
             if epoch % max(1, args.rollout_every) == 0:
                 with torch.no_grad():
@@ -461,7 +473,7 @@ def main():
                 f"val_unroll {last['val']:.6f} (pose {last['pose']:.6f} "
                 f"root {last['root']:.6f} vel {last['vel']:.6f} "
                 f"contact {last['contact']:.6f} foot {last['foot']:.6f} "
-                f"limit {last['limit']:.6f} dvel {last['dvel']:.6f}) ref1 {last['ref']:.6f} "
+                f"limit {last['limit']:.6f} dvel {last['dvel']:.6f} corr {last['corr']:.6f}) ref1 {last['ref']:.6f} "
                 f"roll120_feet {last['roll']:.3f} p {p_pred:.2f}{tag}")
         print(line, flush=True)
         with open(log_path, "a") as f:
@@ -477,12 +489,13 @@ def main():
             else:
                 # Cada chequeo fallido descuenta val_every epochs (regla: 10 epochs).
                 patience_left -= val_every
-                if patience_left <= 0 and epoch >= args.min_epochs:
-                    print("Early stopping.")
-                    break
         if epoch % max(1, args.ckpt_every) == 0:
             save_checkpoint(out_dir / f"{run_id}_epoch{epoch}_pose{last['pose']:.4f}_foot{last['foot']:.4f}.pt",
                             epoch, model, optimizer, scheduler, best_val, config)
+        # El corte VA DESPUES del save: el ultimo epoch siempre queda en disco.
+        if do_val and patience_left <= 0 and epoch >= args.min_epochs:
+            print("Early stopping.")
+            break
     if best_saved:
         print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / f'{run_id}_best.pt'}")
     else:
@@ -507,6 +520,10 @@ def parse_args():
                         help="peso velocity lineal MSE(deltas) (v5; reemplaza log1p)")
     parser.add_argument("--w-dvel", type=float, default=0.0,
                         help="peso velocity SECUENCIAL siMLPe (diffs de secuencia predicha vs GT; 0 = off, regimen intacto)")
+    parser.add_argument("--w-root", type=float, default=1.0,
+                        help="peso root (1.0 = regimen intacto; >1 fuerza control de trayectoria)")
+    parser.add_argument("--w-corr", type=float, default=0.0,
+                        help="peso correctivo leve: castiga crecimiento del error de pose paso a paso (0 = off)")
     parser.add_argument("--w_contact", type=float, default=0.5,
                         help="peso contact con etiquetas GT altura+vel (v5)")
     parser.add_argument("--w_foot", type=float, default=0.5,
