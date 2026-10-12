@@ -26,6 +26,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from bimoe_model import BiMoE
+from mono_model import MonoNet, predict_next
 from losses import (assemble_prediction, foot_contact_loss, foot_sliding_loss,
                     joint_limit_loss, quaternion_sign_invariant_loss,
                     forward_kinematics_batch, total_loss)
@@ -45,7 +46,7 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
            inferior_idx, superior_idx, root_mean, root_std, vel_mean, vel_std,
            feet_mean, feet_std, euler_min, euler_max, frame_time, phase_period,
            w_vel=0.2, w_contact=0.5, w_foot=0.5, w_limit=0.15,
-           p_pred=1.0, detach_carry=True):
+           p_pred=1.0, detach_carry=True, arch="moe"):
     """Desenrolla K pasos. v5 = v4 + velocity lineal + contact + fase + limite 0.15.
     - VELOCITY LINEAL MSE(delta_pred, delta_gt) 0.2: reemplaza al log1p (el log1p
       amplifica ruido en trote; sin evidencia publicada para velocidad de joints).
@@ -78,8 +79,11 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
         contact_mask = (true_feet[:, 1:, :, 1] < 0.10) & (true_speed < 0.15)  # (B,K-1,2)
     for k in range(steps):
         h0 = state[:, :92].reshape(-1, n_joints, 4)
-        lower, upper, _ = model(state)
-        full, root_raw, delta = assemble_prediction(lower, upper, h0, root_prev,
+        if arch == "mono":
+            full, root_raw = predict_next(model(state), h0, root_prev, root_std)
+        else:
+            lower, upper, _ = model(state)
+            full, root_raw, _ = assemble_prediction(lower, upper, h0, root_prev,
                                                     inferior_idx, superior_idx,
                                                     root_mean, root_std, n_joints)
         true_full = true_win[:, k, :92].reshape(-1, n_joints, 4)
@@ -176,8 +180,9 @@ def main():
     val_root_prev = (root_mean + targets[val_starts - 1][:, 92:95] * root_std)
     val_true_root = val_true[:, :, 92:95] * root_std + root_mean  # metros
 
-    model = BiMoE().to(device)
-    print(f"Parametros: {model.count_parameters()}")
+    model = (MonoNet() if args.arch == "mono" else BiMoE()).to(device)
+    prefix = "mono1x" if args.arch == "mono" else "bimoe10k"
+    print(f"Arquitectura: {args.arch} | Parametros: {model.count_parameters()}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -213,7 +218,7 @@ def main():
                          euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
                          w_vel=args.w_vel, w_contact=args.w_contact,
                          w_foot=args.w_foot, w_limit=args.w_limit,
-                         p_pred=p_pred, detach_carry=detach_carry)
+                         p_pred=p_pred, detach_carry=detach_carry, arch=args.arch)
             reg = sum(p.pow(2).sum() for p in model.parameters())
             loss = (out["pose"] + out["root"] + args.w_foot * out["foot"]
                     + 0.3 * out["smooth"] + args.w_limit * out["limit"]
@@ -254,18 +259,27 @@ def main():
                        euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
                        w_vel=args.w_vel, w_contact=args.w_contact,
                        w_foot=args.w_foot, w_limit=args.w_limit,
-                       p_pred=args.ss_end)
+                       p_pred=args.ss_end, arch=args.arch)
             val_tensor = (v["pose"] + v["root"] + args.w_foot * v["foot"]
                           + args.w_limit * v["limit"] + args.w_vel * v["vel"]
                           + args.w_contact * v["contact"])
             val_finite = bool(torch.isfinite(val_tensor).item())
             val_loss = val_tensor.item() if val_finite else float("nan")
             # Referencia one-step clasica sobre pares de val (base real -> target).
-            lo, up, _ = model(val_state0[:512].to(dev))
-            ref, _ = total_loss(lo, up, val_state0[:512].to(dev), val_true[:512, 0].to(dev),
-                                off_d, parents,
-                                inferior_idx, superior_idx, root_mean.to(dev),
-                                root_std.to(dev), euler_min.to(dev), euler_max.to(dev))
+            if args.arch == "mono":
+                d95 = model(val_state0[:512].to(dev))
+                bq = val_state0[:512, :92].reshape(-1, 23, 4).to(dev)
+                br = (val_state0[:512, 276:279].to(dev) * root_std.to(dev)
+                      + root_mean.to(dev))
+                fq, _ = predict_next(d95, bq, br, root_std.to(dev))
+                tq0 = val_true[:512, 0, :92].reshape(-1, 23, 4).to(dev)
+                ref = quaternion_sign_invariant_loss(fq, tq0)
+            else:
+                lo, up, _ = model(val_state0[:512].to(dev))
+                ref, _ = total_loss(lo, up, val_state0[:512].to(dev), val_true[:512, 0].to(dev),
+                                    off_d, parents,
+                                    inferior_idx, superior_idx, root_mean.to(dev),
+                                    root_std.to(dev), euler_min.to(dev), euler_max.to(dev))
         print(f"epoch {epoch:3d} train {train_loss / len(train_loader):.6f} "
               f"val_unroll {val_loss:.6f} (pose {v['pose'].item():.6f} "
               f"root {v['root'].item():.6f} vel {v['vel'].item():.6f} "
@@ -275,19 +289,21 @@ def main():
         if val_finite and val_loss < best_val:
             best_val = val_loss
             patience_left = 20
-            torch.save(model.state_dict(), out_dir / "bimoe10k_best.pt")
+            torch.save(model.state_dict(), out_dir / f"{prefix}_best.pt")
         else:
             patience_left -= 1
             if patience_left == 0:
                 print("Early stopping.")
                 break
         if epoch % 10 == 0:
-            torch.save(model.state_dict(), out_dir / f"bimoe10k_epoch{epoch}.pt")
-    print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / 'bimoe10k_best.pt'}")
+            torch.save(model.state_dict(), out_dir / f"{prefix}_epoch{epoch}.pt")
+    print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / f'{prefix}_best.pt'}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Entrena BiMoE-10K v3 (desenrollado)")
+    parser.add_argument("--arch", default="moe", choices=["moe", "mono"],
+                        help="moe = router+2 expertos (BiMoE), mono = una sola red (1X)")
     parser.add_argument("--data", default="data/locomotion.npz")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch", type=int, default=64)
