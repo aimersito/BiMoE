@@ -80,6 +80,37 @@ class MonoFiLM(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class RootNet(nn.Module):
+    """Cabeza root aislada (apuesta 2 del analisis): MLP 9->32->32->3.
+
+    Input: root_n(3)+vel_n(3)+feet_n(2)+fase(1) = 9 dims del estado.
+    Output: delta-root en unidades normalizadas (x root_std en predict).
+    Init ultima capa a 0 = arranca como velocidad-cero (seguro).
+    El trunk nunca recibe gradiente de root: la loss root solo toca esta red."""
+
+    def __init__(self, hidden=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(9, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 3),
+        )
+        with torch.no_grad():
+            self.net[-1].weight.zero_()
+            self.net[-1].bias.zero_()
+
+    def forward(self, state):
+        root_n = state[:, 276:279]
+        vel_n = state[:, 279:282]
+        feet_n = state[:, 282:284]
+        phase = state[:, -1:]
+        x = torch.cat([root_n, vel_n, feet_n, phase], dim=-1)
+        return self.net(x)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters())
+
+
 def predict_next(delta95, base_quats, base_root_raw, root_std):
     """delta95 (B,95) -> quats unitarios (B,23,4) + root en metros (B,3).
     Residual: siguiente = base + delta, quats renormalizados."""

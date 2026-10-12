@@ -28,9 +28,10 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from bimoe_model import BiMoE
-from mono_model import MonoNet, MonoFiLM, predict_next
+from mono_model import MonoNet, MonoFiLM, RootNet, predict_next
 from losses import (assemble_prediction, foot_contact_loss, foot_sliding_loss,
                     joint_limit_loss, quaternion_sign_invariant_loss,
+                    quaternion_phuber_loss,
                     forward_kinematics_batch, total_loss)
 from preprocess import parse_bvh
 
@@ -44,9 +45,27 @@ def build_windows(targets, starts, steps):
     return true_win, prev_true
 
 
-def save_checkpoint(path, epoch, model, optimizer, scheduler, best_val, config):
+def reparam_state(state, dq_std):
+    """Reparam sin params (apuesta 3): [q0,q1,q2,rest] -> [q0,dq1,dq2,rest].
+    dq1=(q0-q1)/std, dq2=(q1-q2)/std. Misma info, mejor condicionamiento:
+    la velocidad deja de ser una resta O(1) que la red debe descubrir."""
+    q0, q1, q2 = state[:, :92], state[:, 92:184], state[:, 184:276]
+    rest = state[:, 276:]
+    return torch.cat([q0, (q0 - q1) / dq_std, (q1 - q2) / dq_std, rest], dim=1)
+
+
+def reparam_next_state(carry_q_flat, state, dq_std, batch):
+    """Siguiente estado reparamado desde el carry (q0_new=carry, s1_new=(carry-s0)/std, s2_new=s1)."""
+    s0 = state[:, :92]
+    s1 = state[:, 92:184]
+    return torch.cat([carry_q_flat, (carry_q_flat - s0) / dq_std, s1], dim=1)
+
+
+def save_checkpoint(path, epoch, model, optimizer, scheduler, best_val, config,
+                    ema_state=None, root_state=None):
     """Guarda checkpoint completo: pesos + optimizador + scheduler + config.
-    Sin esto no hay resume real (el optimizador fresco rompe la continuidad)."""
+    Sin esto no hay resume real (el optimizador fresco rompe la continuidad).
+    ema_state/root_state opcionales (apuestas 1-2, default off)."""
     torch.save({
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -54,10 +73,12 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, best_val, config):
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "best_val": best_val,
         "config": config,
+        "ema_state_dict": ema_state,
+        "root_state_dict": root_state,
     }, path)
 
 
-def load_resume(path, model, optimizer, scheduler):
+def load_resume(path, model, optimizer, scheduler, root_net=None):
     """Carga checkpoint nuevo (dict) o legacy (solo pesos, optimizador fresco)."""
     ckpt = torch.load(path, map_location="cpu")
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
@@ -68,18 +89,26 @@ def load_resume(path, model, optimizer, scheduler):
                 scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             except Exception as e:
                 print(f"  [resume] scheduler no cargado ({e}), se sigue igual")
+        if root_net is not None:
+            rs = ckpt.get("root_state_dict")
+            if rs is not None:
+                root_net.load_state_dict(rs)
+                print("  [resume] root-net cargada")
+            else:
+                print("  [resume] root-net fresca (ckpt sin root)")
         print(f"  [resume] {path} -> epoch {ckpt.get('epoch')} best {ckpt.get('best_val')}")
-        return int(ckpt.get("epoch", 0)), float(ckpt.get("best_val", float("inf")))
+        return int(ckpt.get("epoch", 0)), float(ckpt.get("best_val", float("inf"))), ckpt.get("ema_state_dict")
     model.load_state_dict(ckpt)
     print(f"  [resume] {path} -> pesos legacy (optimizador fresco, una sola vez)")
-    return 0, float("inf")
+    return 0, float("inf"), None
 
 
 def rollout_120f_metric(model, arch, tq_t, tr_np, phase_np, period, seeds,
-                        stats_d, offsets_d, parents, inf_idx, sup_idx, dt):
+                        stats_d, offsets_d, parents, inf_idx, sup_idx, dt,
+                        root_net=None, reparam=False, dq_std=None, delta_std=None):
     """Rollout game-like 120f liviano para el log: mediana de pies (m) en seeds.
     Misma receta que eval_gates (historial propio, root con velocidad real,
-    fase determinista). Sin gradiente."""
+    fase determinista). Sin gradiente. Soporta root-net/reparam/delta-scale."""
     rm, rs = stats_d["root_mean"], stats_d["root_std"]
     vm, vs = stats_d["vel_mean"], stats_d["vel_std"]
     fm, fs = stats_d["feet_mean"], stats_d["feet_std"]
@@ -100,12 +129,19 @@ def rollout_120f_metric(model, arch, tq_t, tr_np, phase_np, period, seeds,
                                                root_t.reshape(1, 3), offsets_d, parents)
                 feet = torch.stack([torch.minimum(pos[0, 21], pos[0, 22]),
                                     torch.minimum(pos[0, 17], pos[0, 18])])[:, 1]
-                state = torch.cat([x.reshape(-1) for x in hist] +
+                state_raw = torch.cat([x.reshape(-1) for x in hist] +
                                   [(root_t - rm) / rs, (vel_t - vm) / vs,
                                    (feet - fm) / fs,
                                    torch.tensor([ph], device=tq_t.device)])
+                state = (reparam_state(state_raw.unsqueeze(0), dq_std).squeeze(0)
+                         if reparam else state_raw)
                 if arch == "mono":
-                    nxt, _ = predict_next(model(state.unsqueeze(0)),
+                    d95 = model(state.unsqueeze(0))
+                    if delta_std is not None:
+                        d95 = torch.cat([d95[:, :92] * delta_std, d95[:, 92:95]], dim=1)
+                    if root_net is not None:
+                        d95 = torch.cat([d95[:, :92], root_net(state.unsqueeze(0))], dim=1)
+                    nxt, _ = predict_next(d95,
                                           hist[0].reshape(1, 23, 4),
                                           root_t.reshape(1, 3), rs)
                     nxt = nxt.reshape(23, 4)
@@ -133,7 +169,10 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
            inferior_idx, superior_idx, root_mean, root_std, vel_mean, vel_std,
            feet_mean, feet_std, euler_min, euler_max, frame_time, phase_period,
            w_vel=0.2, w_contact=0.5, w_foot=0.5, w_limit=0.15, w_dvel=0.0,
-           p_pred=1.0, detach_carry=True, arch="moe"):
+           p_pred=1.0, detach_carry=True, arch="moe",
+           root_net=None, loss_shape="mse", phuber_eps=0.003,
+           foot_shape="mse", w_step1=1.0, reparam=False, dq_std=None,
+           delta_std=None, foot_mode="batch"):
     """Desenrolla K pasos. v5 = v4 + velocity lineal + contact + fase + limite 0.15.
     - VELOCITY LINEAL MSE(delta_pred, delta_gt) 0.2: reemplaza al log1p (el log1p
       amplifica ruido en trote; sin evidencia publicada para velocidad de joints).
@@ -171,9 +210,15 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
         true_speed = torch.diff(true_feet[:, :, :, [0, 2]], dim=1).norm(dim=-1) / frame_time
         contact_mask = (true_feet[:, 1:, :, 1] < 0.10) & (true_speed < 0.15)  # (B,K-1,2)
     for k in range(steps):
+        # Con reparam, s0 es q0 original (bloque 0 intacto); h0 siempre vale.
         h0 = state[:, :92].reshape(-1, n_joints, 4)
         if arch == "mono":
-            full, root_raw = predict_next(model(state), h0, root_prev, root_std)
+            d95 = model(state)
+            if delta_std is not None:
+                d95 = torch.cat([d95[:, :92] * delta_std, d95[:, 92:95]], dim=1)
+            if root_net is not None:
+                d95 = torch.cat([d95[:, :92], root_net(state)], dim=1)
+            full, root_raw = predict_next(d95, h0, root_prev, root_std)
         else:
             lower, upper, _ = model(state)
             full, root_raw, _ = assemble_prediction(lower, upper, h0, root_prev,
@@ -181,16 +226,21 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
                                                     root_mean, root_std, n_joints)
         true_full = true_win[:, k, :92].reshape(-1, n_joints, 4)
         true_root = true_root_win[:, k]
-        pose_step = quaternion_sign_invariant_loss(full, true_full)
-        pose_sum = pose_sum + pose_step
+        wk = w_step1 if k == 0 else 1.0  # Q3: peso extra al paso con input GT
+        if loss_shape == "phuber":
+            pose_step = quaternion_phuber_loss(full, true_full, phuber_eps)
+        else:
+            pose_step = quaternion_sign_invariant_loss(full, true_full)
+        pose_sum = pose_sum + wk * pose_step
         pose_steps.append(pose_step)
-        root_sum = root_sum + (((root_raw - true_root) / root_std).pow(2)).mean()
-        foot_sum = foot_sum + foot_sliding_loss(full, root_raw, offsets_t, parents,
-                                                     (17, 21), (18, 22))
-        limit_sum = limit_sum + joint_limit_loss(full, euler_min, euler_max)
+        root_sum = root_sum + wk * ((((root_raw - true_root) / root_std).pow(2)).mean())
+        if foot_mode == "batch":
+            foot_sum = foot_sum + wk * foot_sliding_loss(full, root_raw, offsets_t, parents,
+                                                         (17, 21), (18, 22))
+        limit_sum = limit_sum + wk * joint_limit_loss(full, euler_min, euler_max)
         # Velocity LINEAL sobre deltas (v5): MSE directo, sin log1p ni denominador.
         true_delta = true_full - prev_true_win[:, k]
-        vel_sum = vel_sum + ((full - h0) - true_delta).pow(2).mean()
+        vel_sum = vel_sum + wk * (((full - h0) - true_delta).pow(2).mean())
         stacked.append(full)
         # Pies predichos para contact (con gradiente; FK propia del paso).
         pos_pred = forward_kinematics_batch(full, root_raw, offsets_t, parents)
@@ -215,8 +265,11 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
         feet_n = (feet_raw_c - feet_mean) / feet_std
         # Fase determinista (no se predice): avanza 1/periodo por frame.
         phase_next = (state[:, -1:] + 1.0 / phase_period) % 1.0
-        state = torch.cat([carry_q.reshape(batch, -1),
-                           state[:, :184], root_n, vel_n, feet_n, phase_next], dim=1)
+        if reparam:
+            hist_new = reparam_next_state(carry_q.reshape(batch, -1), state, dq_std, batch)
+        else:
+            hist_new = torch.cat([carry_q.reshape(batch, -1), state[:, :184]], dim=1)
+        state = torch.cat([hist_new, root_n, vel_n, feet_n, phase_next], dim=1)
         root_prev = root_raw_c
         if detach_carry:
             state = state.detach()
@@ -247,18 +300,33 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
     # Contact sobre pies predichos apilados (con gradiente) + etiquetas GT.
     pred_feet_seq = torch.stack(pred_feet, dim=1)  # (B, K, 2, 3)
     if steps >= 2:
-        contact = foot_contact_loss(pred_feet_seq, contact_mask)
+        contact = foot_contact_loss(pred_feet_seq, contact_mask,
+                                    shape=foot_shape, eps=phuber_eps)
     else:
         contact = pred_feet_seq.sum() * 0.0
-    n = float(steps)
-    return {"pose": pose_sum / n, "root": root_sum / n, "foot": foot_sum / n,
-            "limit": limit_sum / n, "vel": vel_sum / n, "contact": contact,
+    wsum = float(steps - 1) + w_step1
+    if foot_mode == "time":
+        # Foot sliding sobre el eje TIEMPO de la ventana (misma formula que
+        # foot_sliding_loss pero dim=1 con minimo por ventana): vive con
+        # shuffle (el batch-dim muere: 0.0 exacto con pies flotando).
+        fh = pred_feet_seq[:, :, :, 1]
+        cmask = fh < (fh.amin(dim=1, keepdim=True) + 0.05)
+        move = torch.sqrt(torch.diff(pred_feet_seq[:, :, :, [0, 2]], dim=1).pow(2).sum(dim=-1) + 1e-8)
+        pairs = cmask[:, :-1] & cmask[:, 1:]
+        foot = (move * pairs.float()).sum() / pairs.float().sum().clamp_min(1.0)
+        if pairs.float().sum() == 0:
+            foot = move.mean() * 0.0
+    else:
+        foot = foot_sum / wsum
+    return {"pose": pose_sum / wsum, "root": root_sum / wsum, "foot": foot,
+            "limit": limit_sum / wsum, "vel": vel_sum / wsum, "contact": contact,
             "smooth": smooth, "dvel": dvel, "corr": corr, "stacked": stacked}
 
 
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(device)
     print(f"Dispositivo: {device} | unroll: {args.unroll} | vel: {args.w_vel} "
           f"contact: {args.w_contact} limit: {args.w_limit}")
 
@@ -301,11 +369,35 @@ def main():
 
     model = (MonoFiLM() if (args.arch == "mono" and args.film) else
              MonoNet() if args.arch == "mono" else BiMoE()).to(device)
+    root_net = None
+    if args.root_net > 0 and args.arch == "mono":
+        root_net = RootNet(hidden=args.root_net).to(device)
+    n_params = model.count_parameters() + (root_net.count_parameters() if root_net else 0)
     prefix = "film1x" if (args.arch == "mono" and args.film) else "mono1x" if args.arch == "mono" else "bimoe10k"
     run_id = args.run_id or prefix
-    print(f"Arquitectura: {args.arch} | Parametros: {model.count_parameters()}")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    print(f"Arquitectura: {args.arch}{' + root-net' if root_net else ''} | Parametros: {n_params}")
+    params = list(model.parameters()) + (list(root_net.parameters()) if root_net else [])
+    optimizer = torch.optim.AdamW(params, lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr_final)
+    # Apuesta 3: stats de reparam/delta-scale (data, sin params que aprender).
+    use_reparam = (args.reparam == "dq" and args.arch == "mono")
+    dq_std, delta_std = None, None
+    if use_reparam:
+        with torch.no_grad():
+            hist = inputs[:train_end, :276].reshape(-1, 3, 92)
+            dq = (hist[:, 0] - hist[:, 1])
+            dq_std = dq.std(dim=0, keepdim=True).clamp_min(1e-4).to(dev)
+            dseq = targets[:train_end, :92].reshape(-1, 92)
+            delta_std = (dseq[1:] - dseq[:-1]).std(dim=0, keepdim=True).clamp_min(1e-4).to(dev)
+        print(f"  [reparam] dq_std~{dq_std.mean().item():.5f} delta_std~{delta_std.mean().item():.5f}")
+    # Apuesta 1: EMA shadow (solo inferencia/val, no toca el entreno).
+    ema_model, ema_state = None, None
+    if args.ema > 0:
+        import copy
+        ema_model = copy.deepcopy(model)
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -321,17 +413,29 @@ def main():
                   "(solo si cambias de arquitectura).")
             raise SystemExit(1)
     config = {"arch": args.arch, "film": args.film, "run_id": run_id, "unroll": args.unroll,
-              "batch": args.batch, "noise": args.noise,
+              "batch": args.batch, "noise": args.noise, "noise_std": args.noise_std,
               "w_vel": args.w_vel, "w_contact": args.w_contact,
               "w_foot": args.w_foot, "w_limit": args.w_limit,
               "w_dvel": args.w_dvel, "w_root": args.w_root, "w_corr": args.w_corr,
               "ss_end": args.ss_end, "ss_ramp": args.ss_ramp,
               "full_bptt": args.full_bptt, "val_every": args.val_every,
-              "min_epochs": args.min_epochs, "patience": args.patience}
+              "min_epochs": args.min_epochs, "patience": args.patience,
+              "lr_final": args.lr_final, "ema": args.ema,
+              "reparam": args.reparam, "root_net": args.root_net,
+              "loss_shape": args.loss_shape, "phuber_eps": args.phuber_eps,
+              "foot_shape": args.foot_shape, "w_step1": args.w_step1,
+              "foot_mode": args.foot_mode}
     start_epoch, best_val = 0, float("inf")
     best_saved = False  # este run_id solo tiene _best.pt si mejora al heredado
     if args.resume:
-        start_epoch, best_val = load_resume(args.resume, model, optimizer, scheduler)
+        start_epoch, best_val, ema_state = load_resume(args.resume, model, optimizer,
+                                                       scheduler, root_net)
+        if ema_model is not None:
+            if ema_state is not None:
+                ema_model.load_state_dict(ema_state)
+            else:
+                # best.pt guarda pesos EMA como modelo: arrancar la sombra ahi.
+                ema_model.load_state_dict(model.state_dict())
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{run_id}_{datetime.date.today():%Y%m%d}.log"
@@ -348,7 +452,6 @@ def main():
             "vel": float("nan"), "contact": float("nan"), "foot": float("nan"),
             "limit": float("nan"), "ref": float("nan"), "roll": float("nan"),
             "dvel": float("nan"), "corr": float("nan")}
-    dev = torch.device(device)
     off_d = offsets_t.to(dev)
     # Tensores para el rollout 120f del log (game-like, velocidad real).
     tq_all = torch.from_numpy(bundle["targets"][:, :92]).reshape(-1, 23, 4).float().to(dev)
@@ -370,9 +473,12 @@ def main():
         p_pred = args.ss_end * min(1.0, epoch / max(1, args.ss_ramp))
         for (starts,) in train_loader:
             state0 = inputs[starts].to(dev)
-            if args.noise > 0:
+            if use_reparam:
+                state0 = reparam_state(state0, dq_std)
+            noise_sigma = args.noise_std if args.noise_std > 0 else args.noise
+            if noise_sigma > 0:
                 noisy = state0.clone()
-                noisy[:, :276] += torch.randn_like(noisy[:, :276]) * args.noise
+                noisy[:, :276] += torch.randn_like(noisy[:, :276]) * noise_sigma
                 state0 = noisy
             true_win, prev_win = build_windows(targets, starts, args.unroll)
             true_win, prev_win = true_win.to(dev), prev_win.to(dev)
@@ -386,8 +492,12 @@ def main():
                          w_vel=args.w_vel, w_contact=args.w_contact,
                          w_foot=args.w_foot, w_limit=args.w_limit,
                          w_dvel=args.w_dvel,
-                         p_pred=p_pred, detach_carry=detach_carry, arch=args.arch)
-            reg = sum(p.pow(2).sum() for p in model.parameters())
+                         p_pred=p_pred, detach_carry=detach_carry, arch=args.arch,
+                         root_net=root_net, loss_shape=args.loss_shape,
+                         phuber_eps=args.phuber_eps, foot_shape=args.foot_shape,
+                         w_step1=args.w_step1, reparam=use_reparam, dq_std=dq_std,
+                         delta_std=delta_std, foot_mode=args.foot_mode)
+            reg = sum(p.pow(2).sum() for p in params)
             loss = (out["pose"] + args.w_root * out["root"] + args.w_foot * out["foot"]
                     + 0.3 * out["smooth"] + args.w_limit * out["limit"]
                     + args.w_vel * out["vel"] + args.w_contact * out["contact"]
@@ -405,15 +515,19 @@ def main():
                 continue
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
             # Anti-envenenamiento: un grad inf (p.ej. asin en el borde x8 BPTT)
             # vuelve NaN el clip (inf*0) y mata los pesos para siempre.
             if not all(p.grad is None or torch.isfinite(p.grad).all()
-                       for p in model.parameters()):
+                       for p in params):
                 print(f"  [epoch {epoch}] grad no-finito, se salta", flush=True)
                 optimizer.zero_grad()
                 continue
             optimizer.step()
+            if ema_model is not None:
+                with torch.no_grad():
+                    for e, m in zip(ema_model.parameters(), model.parameters()):
+                        e.mul_(args.ema).add_(m.detach(), alpha=1.0 - args.ema)
             train_loss += loss.item()
         scheduler.step()
 
@@ -421,10 +535,18 @@ def main():
         do_val = (epoch == 1) or (epoch % val_every == 0) or (epoch == args.epochs)
         val_finite = False
         if do_val:
-            model.eval()
+            if ema_model is not None:
+                ema_model.eval()
+                eval_model, eval_state = ema_model, ema_model.state_dict()
+            else:
+                model.eval()
+                eval_model, eval_state = model, None
             with torch.no_grad():
                 # Val con el MISMO p_pred final (mide el regimen del juego).
-                v = unroll(model, val_state0.to(dev), val_root_prev.to(dev),
+                vs0 = val_state0.to(dev)
+                if use_reparam:
+                    vs0 = reparam_state(vs0, dq_std)
+                v = unroll(eval_model, vs0, val_root_prev.to(dev),
                            val_true.to(dev), val_prev.to(dev), val_true_root.to(dev),
                            off_d, parents,
                            inferior_idx, superior_idx, root_mean.to(dev), root_std.to(dev),
@@ -433,7 +555,11 @@ def main():
                            w_vel=args.w_vel, w_contact=args.w_contact,
                            w_foot=args.w_foot, w_limit=args.w_limit,
                            w_dvel=args.w_dvel,
-                           p_pred=args.ss_end, arch=args.arch)
+                           p_pred=args.ss_end, arch=args.arch,
+                           root_net=root_net, loss_shape=args.loss_shape,
+                           phuber_eps=args.phuber_eps, foot_shape=args.foot_shape,
+                           w_step1=args.w_step1, reparam=use_reparam, dq_std=dq_std,
+                           delta_std=delta_std, foot_mode=args.foot_mode)
                 val_tensor = (v["pose"] + args.w_root * v["root"] + args.w_foot * v["foot"]
                               + args.w_limit * v["limit"] + args.w_vel * v["vel"]
                               + args.w_contact * v["contact"]
@@ -442,7 +568,14 @@ def main():
                 val_loss = val_tensor.item() if val_finite else float("nan")
                 # Referencia one-step clasica sobre pares de val (base real -> target).
                 if args.arch == "mono":
-                    d95 = model(val_state0[:512].to(dev))
+                    rs0 = val_state0[:512].to(dev)
+                    if use_reparam:
+                        rs0 = reparam_state(rs0, dq_std)
+                    d95 = eval_model(rs0)
+                    if delta_std is not None:
+                        d95 = torch.cat([d95[:, :92] * delta_std, d95[:, 92:95]], dim=1)
+                    if root_net is not None:
+                        d95 = torch.cat([d95[:, :92], root_net(rs0)], dim=1)
                     bq = val_state0[:512, :92].reshape(-1, 23, 4).to(dev)
                     br = (val_state0[:512, 276:279].to(dev) * root_std.to(dev)
                           + root_mean.to(dev))
@@ -464,11 +597,13 @@ def main():
             # Rollout 120f liviano para el log (solo en epochs de val).
             if epoch % max(1, args.rollout_every) == 0:
                 with torch.no_grad():
-                    last["roll"] = rollout_120f_metric(model, args.arch, tq_all, tr_all,
+                    last["roll"] = rollout_120f_metric(eval_model if ema_model is not None else model, args.arch, tq_all, tr_all,
                                                        phase_all, phase_period, roll_seeds,
                                                        stats_d, off_d, parents,
                                                        inferior_idx, superior_idx,
-                                                       frame_time)
+                                                       frame_time, root_net=root_net,
+                                                       reparam=use_reparam, dq_std=dq_std,
+                                                       delta_std=delta_std)
         tag = "" if do_val else " [sin val]"
         line = (f"epoch {epoch:3d} train {train_loss / len(train_loader):.6f} "
                 f"val_unroll {last['val']:.6f} (pose {last['pose']:.6f} "
@@ -485,14 +620,19 @@ def main():
                 best_val = val_loss
                 best_saved = True
                 patience_left = args.patience
-                save_checkpoint(out_dir / f"{run_id}_best.pt", epoch, model, optimizer,
-                                scheduler, best_val, config)
+                save_checkpoint(out_dir / f"{run_id}_best.pt", epoch,
+                                ema_model if ema_model is not None else model,
+                                optimizer, scheduler, best_val, config,
+                                ema_state=None,
+                                root_state=(root_net.state_dict() if root_net else None))
             else:
                 # Cada chequeo fallido descuenta val_every epochs (regla: 10 epochs).
                 patience_left -= val_every
         if epoch % max(1, args.ckpt_every) == 0:
             save_checkpoint(out_dir / f"{run_id}_epoch{epoch}_pose{last['pose']:.4f}_foot{last['foot']:.4f}.pt",
-                            epoch, model, optimizer, scheduler, best_val, config)
+                            epoch, model, optimizer, scheduler, best_val, config,
+                            ema_state=(ema_model.state_dict() if ema_model else None),
+                            root_state=(root_net.state_dict() if root_net else None))
         # El corte VA DESPUES del save: el ultimo epoch siempre queda en disco.
         if do_val and patience_left <= 0 and epoch >= args.min_epochs:
             print("Early stopping.")
@@ -556,6 +696,26 @@ def parse_args():
                         help="seeds del rollout 120f del log (liviano)")
     parser.add_argument("--val-every", type=int, default=5,
                         help="cada cuantas epochs corre val+ref+rollout (el grueso del costo por epoch)")
+    parser.add_argument("--lr-final", type=float, default=0.0,
+                        help="apuesta 1: lr final del coseno (0 = a cero, regimen intacto; 1e-6 = anneal)")
+    parser.add_argument("--ema", type=float, default=0.0,
+                        help="apuesta 1: sombra EMA con este decay (0 = off; 0.999 = promedia jitter Adam)")
+    parser.add_argument("--reparam", default="none", choices=["none", "dq"],
+                        help="apuesta 3: input [q0,dq1,dq2] z-scored + output delta x delta_std (none = intacto, solo mono)")
+    parser.add_argument("--root-net", type=int, default=0,
+                        help="apuesta 2: cabeza root aislada con este hidden (0 = off, solo mono; 32 = ~1.5k params)")
+    parser.add_argument("--loss-shape", default="mse", choices=["mse", "phuber"],
+                        help="apuesta 5: forma de la loss de pose (mse = intacto)")
+    parser.add_argument("--phuber-eps", type=float, default=0.003,
+                        help="apuesta 5: eps pseudo-Huber (~0.5*RMS1, escala del delta por joint)")
+    parser.add_argument("--foot-shape", default="mse", choices=["mse", "sqrt", "phuber"],
+                        help="apuesta 5: forma del contact (mse = cuadrado intacto; sqrt = L2 MoDi, grad 55-200x)")
+    parser.add_argument("--noise-std", type=float, default=0.0,
+                        help="apuesta 4: sigma GNS en historial quats (0 = usa --noise; ~0.5*RMS1)")
+    parser.add_argument("--w-step1", type=float, default=1.0,
+                        help="Q3: peso del paso 0 del unroll (input GT puro; 1.0 = intacto, 3.0 = ataca el intercepto)")
+    parser.add_argument("--foot-mode", default="batch", choices=["batch", "time"],
+                        help="foot sliding en dim batch (v5, muere con shuffle) o time (ventana, vive siempre)")
     return parser.parse_args()
 
 

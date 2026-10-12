@@ -20,7 +20,7 @@ from matplotlib.animation import FFMpegWriter
 import torch
 
 from bimoe_model import BiMoE
-from mono_model import MonoNet, MonoFiLM, predict_next
+from mono_model import MonoNet, MonoFiLM, RootNet, predict_next
 from losses import forward_kinematics_batch
 from preprocess import parse_bvh
 
@@ -42,6 +42,23 @@ def main():
     model.load_state_dict(state)
     model.eval()
     print(f"Arquitectura detectada: {arch}")
+    root_net = None
+    if isinstance(ckpt, dict) and ckpt.get("root_state_dict") is not None and arch == "mono":
+        cfg = ckpt.get("config", {}) or {}
+        root_net = RootNet(hidden=int(cfg.get("root_net", 32)))
+        root_net.load_state_dict(ckpt["root_state_dict"])
+        root_net.eval()
+        print(f"Cabeza root aislada: {root_net.count_parameters()} params")
+    reparam, dq_std, delta_std = False, None, None
+    if isinstance(ckpt, dict) and (ckpt.get("config", {}) or {}).get("reparam") == "dq":
+        reparam = True
+        ins = bundle["inputs"][:int(bundle["train_end"]), :276].reshape(-1, 3, 92)
+        dq = (ins[:, 0] - ins[:, 1])
+        dq_std = torch.from_numpy(dq.std(axis=0, keepdims=True).astype(np.float32)).clamp_min(1e-4)
+        dseq = bundle["targets"][:int(bundle["train_end"]), :92]
+        delta_std = torch.from_numpy(
+            (dseq[1:] - dseq[:-1]).std(axis=0, keepdims=True).astype(np.float32)).clamp_min(1e-4)
+        print("Reparam dq activa en este ckpt")
     st = {k: torch.from_numpy(bundle[k].astype(np.float32))
           for k in ["root_mean", "root_std", "vel_mean", "vel_std", "feet_mean", "feet_std"]}
     rm, rs, vm, vs, fm, fs = st["root_mean"], st["root_std"], st["vel_mean"], st["vel_std"], st["feet_mean"], st["feet_std"]
@@ -68,11 +85,20 @@ def main():
                                            root_t.reshape(1, 3), off, parents)
             feet = torch.stack([torch.minimum(pos[0, 21], pos[0, 22]),
                                 torch.minimum(pos[0, 17], pos[0, 18])])[:, 1]
-            state = torch.cat([x.reshape(-1) for x in hist] +
+            st = torch.cat([x.reshape(-1) for x in hist] +
                               [(root_t - rm) / rs, (vel_t - vm) / vs, (feet - fm) / fs,
                                torch.tensor([ph])])
+            if reparam:
+                q0, q1, q2 = st[:92], st[92:184], st[184:276]
+                st = torch.cat([q0, (q0 - q1) / dq_std.squeeze(0),
+                                (q1 - q2) / dq_std.squeeze(0), st[276:]])
             if arch == "mono":
-                nxt, _ = predict_next(model(state.unsqueeze(0)),
+                d95 = model(st.unsqueeze(0))
+                if delta_std is not None:
+                    d95 = torch.cat([d95[:, :92] * delta_std, d95[:, 92:95]], dim=1)
+                if root_net is not None:
+                    d95 = torch.cat([d95[:, :92], root_net(st.unsqueeze(0))], dim=1)
+                nxt, _ = predict_next(d95,
                                       hist[0].reshape(1, 23, 4),
                                       root_t.reshape(1, 3), rs)
                 nxt = nxt.reshape(23, 4)

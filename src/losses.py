@@ -15,6 +15,14 @@ def quaternion_sign_invariant_loss(predicted, target):
     return per_joint.mean()
 
 
+def quaternion_phuber_loss(predicted, target, eps):
+    """Sign-invariante con pseudo-Huber elementwise (robusta a outliers)."""
+    pos = torch.sqrt((predicted - target).pow(2) + eps * eps) - eps
+    neg = torch.sqrt((predicted + target).pow(2) + eps * eps) - eps
+    per_joint = torch.minimum(pos.sum(dim=-1), neg.sum(dim=-1))
+    return per_joint.mean()
+
+
 def forward_kinematics_batch(quaternions, root_position, offsets, parents):
     """FK por batch: (batch, nodos, 4) + (batch, 3) -> (batch, nodos, 3)."""
     batch, joint_count, _ = quaternions.shape
@@ -56,15 +64,29 @@ def foot_sliding_loss(pred_quats, pred_root, offsets, parents, ankle_idx, toe_id
     return (movement * contact_pairs.float()).sum() / contact_pairs.sum()
 
 
-def foot_contact_loss(pred_feet_seq, contact_mask):
+def foot_contact_loss(pred_feet_seq, contact_mask, shape="mse", eps=0.005):
     """v5: pies ETIQUETADOS en contacto deben quedarse quietos.
     pred_feet_seq: (B,K,2,3) con gradiente. contact_mask: (B,K-1,2) bool
     (etiqueta del frame k: altura<0.10m AND velocidad<0.15m/s, estándar Kimodo).
-    Castiga desplazamiento horizontal del pie en contacto (HuMoR/MDM)."""
-    movement = torch.diff(pred_feet_seq[:, :, :, [0, 2]], dim=1).pow(2).sum(dim=-1)
+    Castiga desplazamiento horizontal del pie en contacto (HuMoR/MDM).
+    shape: 'mse' (default intacto, cuadrado), 'sqrt' (L2 sin cuadrar estilo
+    codigo MoDi: gradiente 55-200x mayor con d=0.0025-0.009 m/f), 'phuber'."""
+    disp = torch.diff(pred_feet_seq[:, :, :, [0, 2]], dim=1).norm(dim=-1)
+    if shape == "sqrt":
+        movement = disp
+    elif shape == "phuber":
+        movement = torch.sqrt(disp.pow(2) + eps * eps) - eps
+    else:
+        movement = disp.pow(2)
     if contact_mask.sum() == 0:
         return movement.mean() * 0.0
     return (movement * contact_mask.float()).sum() / contact_mask.float().sum()
+
+
+def pseudo_huber_mean(err, eps):
+    """Media pseudo-Huber sqrt(e^2+eps^2)-eps: lineal en grande, cuadratica en chico.
+    Mismo cero y escala que MSE cerca de 0 (dividido por eps para emparejar)."""
+    return (torch.sqrt(err.pow(2) + eps * eps) - eps).mean()
 
 
 def smoothness_loss(pred_quats):
