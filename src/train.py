@@ -300,7 +300,8 @@ def main():
               "w_vel": args.w_vel, "w_contact": args.w_contact,
               "w_foot": args.w_foot, "w_limit": args.w_limit,
               "ss_end": args.ss_end, "ss_ramp": args.ss_ramp,
-              "full_bptt": args.full_bptt, "val_every": args.val_every}
+              "full_bptt": args.full_bptt, "val_every": args.val_every,
+              "min_epochs": args.min_epochs, "patience": args.patience}
     start_epoch, best_val = 0, float("inf")
     if args.resume:
         start_epoch, best_val = load_resume(args.resume, model, optimizer, scheduler)
@@ -455,7 +456,7 @@ def main():
             else:
                 # Cada chequeo fallido descuenta val_every epochs (regla: 10 epochs).
                 patience_left -= val_every
-                if patience_left <= 0:
+                if patience_left <= 0 and epoch >= args.min_epochs:
                     print("Early stopping.")
                     break
         if epoch % max(1, args.ckpt_every) == 0:
@@ -500,6 +501,8 @@ def parse_args():
                         help="cada cuantas epochs guarda checkpoint descriptivo")
     parser.add_argument("--patience", type=int, default=10,
                         help="early stopping: epochs sin mejorar val_unroll (descuenta val-every por chequeo)")
+    parser.add_argument("--min-epochs", type=int, default=40,
+                        help="el early stopping no actua antes de esta epoch (evita matar runs bebes)")
     parser.add_argument("--rollout-every", type=int, default=5,
                         help="cada cuantas epochs loguea rollout 120f (solo log, no toca entreno)")
     parser.add_argument("--rollout-seeds", type=int, default=2,
