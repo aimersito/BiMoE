@@ -242,6 +242,10 @@ def main():
     inputs = torch.from_numpy(bundle["inputs"])
     targets = torch.from_numpy(bundle["targets"])
     train_end, val_end = int(bundle["train_end"]), int(bundle["val_end"])
+    # Datos chicos (~8 MB): a GPU una sola vez, se acaban las transferencias por batch.
+    if device == "cuda":
+        inputs = inputs.cuda()
+        targets = targets.cuda()
     frame_time = float(bundle["frame_time"])
     phase_period = float(bundle["phase_period"])
     inferior_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
@@ -292,7 +296,7 @@ def main():
               "w_vel": args.w_vel, "w_contact": args.w_contact,
               "w_foot": args.w_foot, "w_limit": args.w_limit,
               "ss_end": args.ss_end, "ss_ramp": args.ss_ramp,
-              "full_bptt": args.full_bptt}
+              "full_bptt": args.full_bptt, "val_every": args.val_every}
     start_epoch, best_val = 0, float("inf")
     if args.resume:
         start_epoch, best_val = load_resume(args.resume, model, optimizer, scheduler)
@@ -306,6 +310,11 @@ def main():
     detach_carry = not args.full_bptt
     print(f"BPTT: {'completo (encadenado)' if args.full_bptt else 'truncado (estable)'}")
     patience_left = args.patience
+    val_every = max(1, args.val_every)
+    # Cache del ultimo val (las epochs sin val loguean train + ultimo val).
+    last = {"val": float("nan"), "pose": float("nan"), "root": float("nan"),
+            "vel": float("nan"), "contact": float("nan"), "foot": float("nan"),
+            "limit": float("nan"), "ref": float("nan"), "roll": float("nan")}
     dev = torch.device(device)
     off_d = offsets_t.to(dev)
     # Tensores para el rollout 120f del log (game-like, velocidad real).
@@ -373,69 +382,80 @@ def main():
             train_loss += loss.item()
         scheduler.step()
 
-        model.eval()
-        with torch.no_grad():
-            # Val con el MISMO p_pred final (mide el regimen del juego).
-            v = unroll(model, val_state0.to(dev), val_root_prev.to(dev),
-                       val_true.to(dev), val_prev.to(dev), val_true_root.to(dev),
-                       off_d, parents,
-                       inferior_idx, superior_idx, root_mean.to(dev), root_std.to(dev),
-                       vel_mean.to(dev), vel_std.to(dev), feet_mean.to(dev), feet_std.to(dev),
-                       euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
-                       w_vel=args.w_vel, w_contact=args.w_contact,
-                       w_foot=args.w_foot, w_limit=args.w_limit,
-                       p_pred=args.ss_end, arch=args.arch)
-            val_tensor = (v["pose"] + v["root"] + args.w_foot * v["foot"]
-                          + args.w_limit * v["limit"] + args.w_vel * v["vel"]
-                          + args.w_contact * v["contact"])
-            val_finite = bool(torch.isfinite(val_tensor).item())
-            val_loss = val_tensor.item() if val_finite else float("nan")
-            # Referencia one-step clasica sobre pares de val (base real -> target).
-            if args.arch == "mono":
-                d95 = model(val_state0[:512].to(dev))
-                bq = val_state0[:512, :92].reshape(-1, 23, 4).to(dev)
-                br = (val_state0[:512, 276:279].to(dev) * root_std.to(dev)
-                      + root_mean.to(dev))
-                fq, _ = predict_next(d95, bq, br, root_std.to(dev))
-                tq0 = val_true[:512, 0, :92].reshape(-1, 23, 4).to(dev)
-                ref = quaternion_sign_invariant_loss(fq, tq0)
-            else:
-                lo, up, _ = model(val_state0[:512].to(dev))
-                ref, _ = total_loss(lo, up, val_state0[:512].to(dev), val_true[:512, 0].to(dev),
-                                    off_d, parents,
-                                    inferior_idx, superior_idx, root_mean.to(dev),
-                                    root_std.to(dev), euler_min.to(dev), euler_max.to(dev))
-        # Rollout 120f liviano para el log (cada rollout_every epochs).
-        if epoch % max(1, args.rollout_every) == 0:
+        # Val con cadencia (el grueso del costo por epoch): ep1, cada val_every y ultima.
+        do_val = (epoch == 1) or (epoch % val_every == 0) or (epoch == args.epochs)
+        val_finite = False
+        if do_val:
+            model.eval()
             with torch.no_grad():
-                roll_feet = rollout_120f_metric(model, args.arch, tq_all, tr_all, phase_all,
-                                                phase_period, roll_seeds, stats_d,
-                                                off_d, parents, inferior_idx,
-                                                superior_idx, frame_time)
-        else:
-            roll_feet = float("nan")
+                # Val con el MISMO p_pred final (mide el regimen del juego).
+                v = unroll(model, val_state0.to(dev), val_root_prev.to(dev),
+                           val_true.to(dev), val_prev.to(dev), val_true_root.to(dev),
+                           off_d, parents,
+                           inferior_idx, superior_idx, root_mean.to(dev), root_std.to(dev),
+                           vel_mean.to(dev), vel_std.to(dev), feet_mean.to(dev), feet_std.to(dev),
+                           euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
+                           w_vel=args.w_vel, w_contact=args.w_contact,
+                           w_foot=args.w_foot, w_limit=args.w_limit,
+                           p_pred=args.ss_end, arch=args.arch)
+                val_tensor = (v["pose"] + v["root"] + args.w_foot * v["foot"]
+                              + args.w_limit * v["limit"] + args.w_vel * v["vel"]
+                              + args.w_contact * v["contact"])
+                val_finite = bool(torch.isfinite(val_tensor).item())
+                val_loss = val_tensor.item() if val_finite else float("nan")
+                # Referencia one-step clasica sobre pares de val (base real -> target).
+                if args.arch == "mono":
+                    d95 = model(val_state0[:512].to(dev))
+                    bq = val_state0[:512, :92].reshape(-1, 23, 4).to(dev)
+                    br = (val_state0[:512, 276:279].to(dev) * root_std.to(dev)
+                          + root_mean.to(dev))
+                    fq, _ = predict_next(d95, bq, br, root_std.to(dev))
+                    tq0 = val_true[:512, 0, :92].reshape(-1, 23, 4).to(dev)
+                    ref = quaternion_sign_invariant_loss(fq, tq0)
+                else:
+                    lo, up, _ = model(val_state0[:512].to(dev))
+                    ref, _ = total_loss(lo, up, val_state0[:512].to(dev), val_true[:512, 0].to(dev),
+                                        off_d, parents,
+                                        inferior_idx, superior_idx, root_mean.to(dev),
+                                        root_std.to(dev), euler_min.to(dev), euler_max.to(dev))
+                if val_finite:
+                    last.update({"val": val_loss, "pose": v["pose"].item(),
+                                 "root": v["root"].item(), "vel": v["vel"].item(),
+                                 "contact": v["contact"].item(), "foot": v["foot"].item(),
+                                 "limit": v["limit"].item(), "ref": ref.item()})
+            # Rollout 120f liviano para el log (solo en epochs de val).
+            if epoch % max(1, args.rollout_every) == 0:
+                with torch.no_grad():
+                    last["roll"] = rollout_120f_metric(model, args.arch, tq_all, tr_all,
+                                                       phase_all, phase_period, roll_seeds,
+                                                       stats_d, off_d, parents,
+                                                       inferior_idx, superior_idx,
+                                                       frame_time)
+        tag = "" if do_val else " [sin val]"
         line = (f"epoch {epoch:3d} train {train_loss / len(train_loader):.6f} "
-                f"val_unroll {val_loss:.6f} (pose {v['pose'].item():.6f} "
-                f"root {v['root'].item():.6f} vel {v['vel'].item():.6f} "
-                f"contact {v['contact'].item():.6f} foot {v['foot'].item():.6f} "
-                f"limit {v['limit'].item():.6f}) ref1 {ref.item():.6f} "
-                f"roll120_feet {roll_feet:.3f} p {p_pred:.2f}")
+                f"val_unroll {last['val']:.6f} (pose {last['pose']:.6f} "
+                f"root {last['root']:.6f} vel {last['vel']:.6f} "
+                f"contact {last['contact']:.6f} foot {last['foot']:.6f} "
+                f"limit {last['limit']:.6f}) ref1 {last['ref']:.6f} "
+                f"roll120_feet {last['roll']:.3f} p {p_pred:.2f}{tag}")
         print(line, flush=True)
         with open(log_path, "a") as f:
             f.write(line + "\n")
 
-        if val_finite and val_loss < best_val:
-            best_val = val_loss
-            patience_left = args.patience
-            save_checkpoint(out_dir / f"{run_id}_best.pt", epoch, model, optimizer,
-                            scheduler, best_val, config)
-        else:
-            patience_left -= 1
-            if patience_left == 0:
-                print("Early stopping.")
-                break
+        if do_val:
+            if val_finite and val_loss < best_val:
+                best_val = val_loss
+                patience_left = args.patience
+                save_checkpoint(out_dir / f"{run_id}_best.pt", epoch, model, optimizer,
+                                scheduler, best_val, config)
+            else:
+                # Cada chequeo fallido descuenta val_every epochs (regla: 10 epochs).
+                patience_left -= val_every
+                if patience_left <= 0:
+                    print("Early stopping.")
+                    break
         if epoch % max(1, args.ckpt_every) == 0:
-            save_checkpoint(out_dir / f"{run_id}_epoch{epoch}_pose{v['pose'].item():.4f}_foot{v['foot'].item():.4f}.pt",
+            save_checkpoint(out_dir / f"{run_id}_epoch{epoch}_pose{last['pose']:.4f}_foot{last['foot']:.4f}.pt",
                             epoch, model, optimizer, scheduler, best_val, config)
     print(f"Mejor val_unroll: {best_val:.6f} -> {out_dir / f'{run_id}_best.pt'}")
 
@@ -475,11 +495,13 @@ def parse_args():
     parser.add_argument("--ckpt-every", type=int, default=5,
                         help="cada cuantas epochs guarda checkpoint descriptivo")
     parser.add_argument("--patience", type=int, default=10,
-                        help="early stopping: epochs sin mejorar val_unroll")
-    parser.add_argument("--rollout-every", type=int, default=1,
-                        help="cada cuantas epochs loguea rollout 120f")
+                        help="early stopping: epochs sin mejorar val_unroll (descuenta val-every por chequeo)")
+    parser.add_argument("--rollout-every", type=int, default=5,
+                        help="cada cuantas epochs loguea rollout 120f (solo log, no toca entreno)")
     parser.add_argument("--rollout-seeds", type=int, default=2,
                         help="seeds del rollout 120f del log (liviano)")
+    parser.add_argument("--val-every", type=int, default=5,
+                        help="cada cuantas epochs corre val+ref+rollout (el grueso del costo por epoch)")
     return parser.parse_args()
 
 
