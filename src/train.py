@@ -132,11 +132,16 @@ def rollout_120f_metric(model, arch, tq_t, tr_np, phase_np, period, seeds,
 def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win, offsets_t, parents,
            inferior_idx, superior_idx, root_mean, root_std, vel_mean, vel_std,
            feet_mean, feet_std, euler_min, euler_max, frame_time, phase_period,
-           w_vel=0.2, w_contact=0.5, w_foot=0.5, w_limit=0.15,
+           w_vel=0.2, w_contact=0.5, w_foot=0.5, w_limit=0.15, w_dvel=0.0,
            p_pred=1.0, detach_carry=True, arch="moe"):
     """Desenrolla K pasos. v5 = v4 + velocity lineal + contact + fase + limite 0.15.
     - VELOCITY LINEAL MSE(delta_pred, delta_gt) 0.2: reemplaza al log1p (el log1p
       amplifica ruido en trote; sin evidencia publicada para velocidad de joints).
+    - DVEL SECUENCIAL (siMLPe dloss, opt-in con --w-dvel): MSE entre diffs de la
+      secuencia predicha apilada y diffs del GT. Difiere del vel por paso: ese
+      mide el delta contra el carry (que con sampling puede ser prediccion
+      propia); este mide la velocidad del movimiento predicho sin importar el
+      carry. Ataca P1 directo (fidelidad de paso en el tiempo).
     - CONTACT 0.5: etiquetas del GT (altura<0.10m AND vel<0.15m/s, Kimodo) sobre
       pies predichos (HuMoR/MDM). Ataca pies flotantes directo.
     - FASE: input 285, avance determinista fase += 1/periodo (truco PFNN barato).
@@ -214,6 +219,13 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
             state = state.detach()
             root_prev = root_prev.detach()
     stacked = torch.stack(stacked, dim=1)  # (B, K, J, 4)
+    # DVEL secuencial (siMLPe dloss): velocidad del movimiento predicho vs GT,
+    # independiente del carry. Solo existe con K>=2.
+    gt_seq = true_win[:, :, :92].reshape(true_win.shape[0], steps, n_joints, 4)
+    if steps >= 2:
+        dvel = torch.diff(stacked, dim=1).sub(torch.diff(gt_seq, dim=1)).pow(2).mean()
+    else:
+        dvel = stacked.sum() * 0.0
     # Suavidad sobre el eje TIEMPO (dim=1), no sobre el batch.
     if steps >= 3:
         vel = torch.diff(stacked, dim=1)
@@ -229,7 +241,7 @@ def unroll(model, state0, root_prev_raw, true_win, prev_true_win, true_root_win,
     n = float(steps)
     return {"pose": pose_sum / n, "root": root_sum / n, "foot": foot_sum / n,
             "limit": limit_sum / n, "vel": vel_sum / n, "contact": contact,
-            "smooth": smooth, "stacked": stacked}
+            "smooth": smooth, "dvel": dvel, "stacked": stacked}
 
 
 def main():
@@ -299,6 +311,7 @@ def main():
               "batch": args.batch, "noise": args.noise,
               "w_vel": args.w_vel, "w_contact": args.w_contact,
               "w_foot": args.w_foot, "w_limit": args.w_limit,
+              "w_dvel": args.w_dvel,
               "ss_end": args.ss_end, "ss_ramp": args.ss_ramp,
               "full_bptt": args.full_bptt, "val_every": args.val_every,
               "min_epochs": args.min_epochs, "patience": args.patience}
@@ -319,7 +332,8 @@ def main():
     # Cache del ultimo val (las epochs sin val loguean train + ultimo val).
     last = {"val": float("nan"), "pose": float("nan"), "root": float("nan"),
             "vel": float("nan"), "contact": float("nan"), "foot": float("nan"),
-            "limit": float("nan"), "ref": float("nan"), "roll": float("nan")}
+            "limit": float("nan"), "ref": float("nan"), "roll": float("nan"),
+            "dvel": float("nan")}
     dev = torch.device(device)
     off_d = offsets_t.to(dev)
     # Tensores para el rollout 120f del log (game-like, velocidad real).
@@ -357,11 +371,13 @@ def main():
                          euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
                          w_vel=args.w_vel, w_contact=args.w_contact,
                          w_foot=args.w_foot, w_limit=args.w_limit,
+                         w_dvel=args.w_dvel,
                          p_pred=p_pred, detach_carry=detach_carry, arch=args.arch)
             reg = sum(p.pow(2).sum() for p in model.parameters())
             loss = (out["pose"] + out["root"] + args.w_foot * out["foot"]
                     + 0.3 * out["smooth"] + args.w_limit * out["limit"]
                     + args.w_vel * out["vel"] + args.w_contact * out["contact"]
+                    + args.w_dvel * out["dvel"]
                     + 1e-5 * reg)
             if not torch.isfinite(loss):
                 with torch.no_grad():
@@ -369,7 +385,7 @@ def main():
                             for k, v in {"pose": out["pose"], "root": out["root"],
                                          "foot": out["foot"], "contact": out["contact"],
                                          "smooth": out["smooth"], "limit": out["limit"],
-                                         "vel": out["vel"]}.items()}
+                                         "vel": out["vel"], "dvel": out["dvel"]}.items()}
                 print(f"  [epoch {epoch}] batch no-finito: {diag}", flush=True)
                 optimizer.zero_grad()
                 continue
@@ -402,10 +418,12 @@ def main():
                            euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
                            w_vel=args.w_vel, w_contact=args.w_contact,
                            w_foot=args.w_foot, w_limit=args.w_limit,
+                           w_dvel=args.w_dvel,
                            p_pred=args.ss_end, arch=args.arch)
                 val_tensor = (v["pose"] + v["root"] + args.w_foot * v["foot"]
                               + args.w_limit * v["limit"] + args.w_vel * v["vel"]
-                              + args.w_contact * v["contact"])
+                              + args.w_contact * v["contact"]
+                              + args.w_dvel * v["dvel"])
                 val_finite = bool(torch.isfinite(val_tensor).item())
                 val_loss = val_tensor.item() if val_finite else float("nan")
                 # Referencia one-step clasica sobre pares de val (base real -> target).
@@ -427,7 +445,8 @@ def main():
                     last.update({"val": val_loss, "pose": v["pose"].item(),
                                  "root": v["root"].item(), "vel": v["vel"].item(),
                                  "contact": v["contact"].item(), "foot": v["foot"].item(),
-                                 "limit": v["limit"].item(), "ref": ref.item()})
+                                 "limit": v["limit"].item(), "ref": ref.item(),
+                                 "dvel": v["dvel"].item()})
             # Rollout 120f liviano para el log (solo en epochs de val).
             if epoch % max(1, args.rollout_every) == 0:
                 with torch.no_grad():
@@ -441,7 +460,7 @@ def main():
                 f"val_unroll {last['val']:.6f} (pose {last['pose']:.6f} "
                 f"root {last['root']:.6f} vel {last['vel']:.6f} "
                 f"contact {last['contact']:.6f} foot {last['foot']:.6f} "
-                f"limit {last['limit']:.6f}) ref1 {last['ref']:.6f} "
+                f"limit {last['limit']:.6f} dvel {last['dvel']:.6f}) ref1 {last['ref']:.6f} "
                 f"roll120_feet {last['roll']:.3f} p {p_pred:.2f}{tag}")
         print(line, flush=True)
         with open(log_path, "a") as f:
@@ -480,6 +499,8 @@ def parse_args():
                         help="gradiente encadenado entre pasos (por defecto: truncado)")
     parser.add_argument("--w_vel", type=float, default=0.2,
                         help="peso velocity lineal MSE(deltas) (v5; reemplaza log1p)")
+    parser.add_argument("--w-dvel", type=float, default=0.0,
+                        help="peso velocity SECUENCIAL siMLPe (diffs de secuencia predicha vs GT; 0 = off, regimen intacto)")
     parser.add_argument("--w_contact", type=float, default=0.5,
                         help="peso contact con etiquetas GT altura+vel (v5)")
     parser.add_argument("--w_foot", type=float, default=0.5,
