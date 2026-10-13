@@ -40,10 +40,12 @@ def load_all(weights_path, data_path=None):
     # Autodeteccion: keys con 'router' = MoE, con 'film' = mono-FiLM, si no = mono (1X).
     arch = "moe" if any("router" in k for k in state.keys()) else "mono"
     if arch == "mono" and any("film" in k for k in state.keys()):
-        model = MonoFiLM()
+        h = int((ckpt.get("config", {}) or {}).get("hidden", 56)) if isinstance(ckpt, dict) else 56
+        model = MonoFiLM(hidden=h)
         print("Variante detectada: FiLM (fase modula ocultas)")
     else:
-        model = BiMoE() if arch == "moe" else MonoNet()
+        h = int((ckpt.get("config", {}) or {}).get("hidden", 56)) if isinstance(ckpt, dict) else 56
+        model = BiMoE() if arch == "moe" else MonoNet(hidden=h)
     model.load_state_dict(state)
     model.eval()
     print(f"Arquitectura detectada: {arch}")

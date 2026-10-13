@@ -394,8 +394,8 @@ def main():
     val_root_prev = (root_mean + targets[val_starts - 1][:, 92:95] * root_std)
     val_true_root = val_true[:, :, 92:95] * root_std + root_mean  # metros
 
-    model = (MonoFiLM() if (args.arch == "mono" and args.film) else
-             MonoNet() if args.arch == "mono" else BiMoE()).to(device)
+    model = (MonoFiLM(hidden=args.hidden) if (args.arch == "mono" and args.film) else
+             MonoNet(hidden=args.hidden) if args.arch == "mono" else BiMoE()).to(device)
     root_net = None
     if args.root_net > 0 and args.arch == "mono":
         root_net = RootNet(hidden=args.root_net).to(device)
@@ -439,7 +439,7 @@ def main():
             print("Usa --resume <ckpt> para continuar o --fresh para reiniciar "
                   "(solo si cambias de arquitectura).")
             raise SystemExit(1)
-    config = {"arch": args.arch, "film": args.film, "run_id": run_id, "unroll": args.unroll,
+    config = {"arch": args.arch, "film": args.film, "hidden": args.hidden, "run_id": run_id, "unroll": args.unroll,
               "batch": args.batch, "noise": args.noise, "noise_std": args.noise_std,
               "w_vel": args.w_vel, "w_contact": args.w_contact,
               "w_foot": args.w_foot, "w_limit": args.w_limit,
@@ -706,6 +706,8 @@ def parse_args():
                         help="moe = router+2 expertos (BiMoE), mono = una sola red (1X)")
     parser.add_argument("--film", action="store_true",
                         help="mono con fase que modula ocultas (vaso nuevo PFNN-barato; NO admite --resume de pesos mono, run fresco)")
+    parser.add_argument("--hidden", type=int, default=56,
+                        help="ancho oculto mono (56 = 32k; 128 = ~82k; vaso nuevo si cambia)")
     parser.add_argument("--data", default="data/locomotion.npz")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch", type=int, default=64)

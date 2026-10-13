@@ -38,7 +38,8 @@ def main():
         print(f"Checkpoint: epoch {ckpt.get('epoch')} best {ckpt.get('best_val')}")
     # Autodeteccion: keys con 'router' = MoE, con 'film' = mono-FiLM, si no = mono (misma regla que eval_gates).
     arch = "moe" if any("router" in k for k in state.keys()) else "mono"
-    model = BiMoE() if arch == "moe" else (MonoFiLM() if any("film" in k for k in state.keys()) else MonoNet())
+    h = int((ckpt.get("config", {}) or {}).get("hidden", 56)) if isinstance(ckpt, dict) else 56
+    model = BiMoE() if arch == "moe" else (MonoFiLM(hidden=h) if any("film" in k for k in state.keys()) else MonoNet(hidden=h))
     model.load_state_dict(state)
     model.eval()
     print(f"Arquitectura detectada: {arch}")
