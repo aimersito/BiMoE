@@ -96,7 +96,10 @@ def load_resume(path, model, optimizer, scheduler, root_net=None):
     ckpt = torch.load(path, map_location="cpu")
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except Exception as e:
+            print(f"  [resume] optimizer fresco (grupo distinto: {e})")
         if scheduler is not None and ckpt.get("scheduler_state_dict"):
             try:
                 scheduler.load_state_dict(ckpt["scheduler_state_dict"])
