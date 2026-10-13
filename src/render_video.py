@@ -27,7 +27,7 @@ from preprocess import parse_bvh
 
 def main():
     a = parse_args()
-    bundle = np.load(ROOT / "data" / "locomotion.npz")
+    bundle = np.load(ROOT / (a.data or "data/locomotion.npz"))
     names, parents, offsets, _, _, frame_time = parse_bvh(
         ROOT / "dataset" / "additional_basic_locomotion_2.bvh")
     ft = float(frame_time)
@@ -68,16 +68,27 @@ def main():
     inf_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
     sup_idx = sorted(set(int(j) for j in bundle["superior_joints"]))
     n = len(tq)
-    seed = min(int(bundle["val_end"]) + 10, n - a.frames - 2)
+    if "clip_id" in bundle:  # multi-clip: seed en el primer clip de test con hueco
+        bounds = np.asarray(bundle["clip_bounds"])
+        va = int(bundle["val_end"])
+        pick = [i for i in range(len(bounds)) if bounds[i, 0] >= va
+                and bounds[i, 1] - bounds[i, 0] >= a.frames + 10][0]
+        lo = int(bounds[pick, 0])
+        seed = lo + 10
+        seed_lim = int(bounds[pick, 1]) - 1
+        period = float(np.asarray(bundle["phase_periods"])[int(np.asarray(bundle["clip_id"])[lo])])
+    else:
+        seed = min(int(bundle["val_end"]) + 10, n - a.frames - 2)
+        seed_lim = n - 1
+        period = float(bundle["phase_period"])
     hist = [tq[seed].clone(), tq[seed - 1].clone(), tq[seed - 2].clone()]
     root = tr[seed].copy()
     ph = float(bundle["phase"][seed + 3] % 1.0)
-    period = float(bundle["phase_period"])
     true_vel = (tr[1:] - tr[:-1]) / ft
     quats, roots = [], []
     with torch.no_grad():
         for h in range(a.frames):
-            v = true_vel[min(seed + h, len(true_vel) - 1)]
+            v = true_vel[min(seed + h, seed_lim - 1)]
             root = root + v * ft
             root_t = torch.from_numpy(root).float()
             vel_t = torch.from_numpy(v).float()
@@ -148,6 +159,7 @@ def main():
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default="weights/bimoe10k_best.pt")
+    p.add_argument("--data", default="data/locomotion.npz")
     p.add_argument("--frames", type=int, default=120)
     p.add_argument("--out", default="/tmp/opencode/bimoe_v4.mp4")
     return p.parse_args()

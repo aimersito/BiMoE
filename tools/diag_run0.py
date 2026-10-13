@@ -24,19 +24,20 @@ import torch
 SRC = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(SRC))
 
-from eval_gates import load_all, rollout, quat_mse, cv_baseline  # noqa: E402
+from eval_gates import load_all, rollout, quat_mse, cv_baseline, clip_seeds  # noqa: E402
 from mono_model import predict_next  # noqa: E402
 from losses import quaternion_sign_invariant_loss, forward_kinematics_batch  # noqa: E402
 
 
 def p1_for(model, arch, tq, tr, phase, period, seeds, h, stats, off, parents, dt,
            inf_idx, sup_idx, root_net=None, reparam=False, dq_std=None, delta_std=None,
-           with_cv=False):
+           with_cv=False, seed_per=None):
     ms, cs = [], []
     for s in seeds:
         pred, _ = rollout(model, arch, tq, tr, phase, period, s, h, stats, off,
                           parents, dt, inf_idx, sup_idx, root_net=root_net,
-                          reparam=reparam, dq_std=dq_std, delta_std=delta_std)
+                          reparam=reparam, dq_std=dq_std, delta_std=delta_std,
+                          seed_per=seed_per)
         real = tq[s + 1:s + 1 + h].numpy()
         ms.append(quat_mse(pred, real[:len(pred)]))
         if with_cv:
@@ -45,7 +46,8 @@ def p1_for(model, arch, tq, tr, phase, period, seeds, h, stats, off, parents, dt
 
 
 def p1_free_root(model, tq, tr, phase, period, seeds, h, stats, off, parents, dt,
-                 root_net=None, reparam=False, dq_std=None, delta_std=None, **_):
+                 root_net=None, reparam=False, dq_std=None, delta_std=None,
+                 seed_per=None, **_):
     """M1: P1 con root PROPIO integrado (sin velocidad real forzada).
     La brecha free-vs-forced = cuanto del drift maneja el root (apuesta 2)."""
     rm, rs, vm, vs, fm, fs = (stats["root_mean"], stats["root_std"], stats["vel_mean"],
@@ -53,6 +55,7 @@ def p1_free_root(model, tq, tr, phase, period, seeds, h, stats, off, parents, dt
     errs = []
     with torch.no_grad():
         for s in seeds:
+            per = (seed_per or {}).get(s, period)
             hist = [tq[s].clone(), tq[s - 1].clone(), tq[s - 2].clone()]
             root = tr[s].copy()
             root_prev = root.copy()
@@ -83,7 +86,7 @@ def p1_free_root(model, tq, tr, phase, period, seeds, h, stats, off, parents, dt
                 hist = [nxt, hist[0], hist[1]]
                 root_prev = root.copy()
                 root = root_raw.reshape(3).numpy()
-                ph = (ph + 1.0 / period) % 1.0
+                ph = (ph + 1.0 / per) % 1.0
                 pred.append(nxt.numpy())
             real = tq[s + 1:s + 1 + h].numpy()
             errs.append(quat_mse(np.array(pred), real[:len(pred)]))
@@ -96,14 +99,22 @@ def main():
     for ckpt_path in a.ckpt:
         print(f"=== {Path(ckpt_path).name} ===")
         (model, bundle, parents, off, dt, stats, tq, tr, phase, period, arch,
-         root_net, reparam, dq_std, delta_std) = load_all(ckpt_path)
+         root_net, reparam, dq_std, delta_std, clip) = load_all(ckpt_path, a.data)
         inf_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
         sup_idx = sorted(set(int(j) for j in bundle["superior_joints"]))
         te, va, n = int(bundle["train_end"]), int(bundle["val_end"]), len(tq)
-        seeds8 = sorted(set(min(va + 10 + i * 80, n - 130) for i in range(8)))
+        if clip is not None:
+            tcs = [i for i in range(len(clip["bounds"])) if clip["bounds"][i, 0] >= va]
+            seeds8, seed_per = clip_seeds(clip, tcs, 8, 8)
+            trcs = [i for i in range(len(clip["bounds"])) if clip["bounds"][i, 1] <= te]
+            tseeds, _ = clip_seeds(clip, trcs, 8, 4)
+        else:
+            seeds8 = sorted(set(min(va + 10 + i * 80, n - 130) for i in range(8)))
+            tseeds = sorted(set(min(10 + i * 80, te - 130) for i in range(8)))
+            seed_per = None
         kw = dict(stats=stats, off=off, parents=parents, dt=dt, inf_idx=inf_idx,
                   sup_idx=sup_idx, root_net=root_net, reparam=reparam,
-                  dq_std=dq_std, delta_std=delta_std)
+                  dq_std=dq_std, delta_std=delta_std, seed_per=seed_per)
         # M1: horizontes cortos + CV + root propio (particion del intercepto).
         hs = [1, 2, 3, 5, 10, 20, 24]
         p1 = {h: p1_for(model, arch, tq, tr, phase, period, seeds8, h, **kw,
@@ -153,7 +164,8 @@ def main():
             cvs[h] = float(np.mean(errs))
         print(f"  M3 CV: " + " ".join(f"{h}f {cvs[h]:.5f}" for h in [5, 10, 20, 24]))
         # M4: a en TRAIN vs TEST.
-        tseeds = sorted(set(min(10 + i * 80, te - 130) for i in range(8)))
+        if clip is None:
+            tseeds = sorted(set(min(10 + i * 80, te - 130) for i in range(8)))
         tr5, _, _ = p1_for(model, arch, tq, tr, phase, period, tseeds, 5, **kw)
         tr24, _, _ = p1_for(model, arch, tq, tr, phase, period, tseeds, 24, **kw)
         a_tr = tr5 - 5 * (tr24 - tr5) / 19.0
@@ -179,12 +191,20 @@ def main():
                                   np.minimum(pos[:, 17, 1], pos[:, 18, 1]))
                 meds.append(float(np.median(feet)))
         print(f"  M6 pies_GT {np.median(meds):.3f}m (piso de la metrica)")
-        # M7: 58 ventanas stride 10 + bootstrap por bloques de 9 + cobertura fase.
-        w58 = []
-        for i in range(58):
-            s = min(va + 10 + i * 10, n - 130)
-            if s not in w58:
-                w58.append(s)
+        # M7: ventanas stride 10 + bootstrap por bloques de 9 + cobertura fase.
+        # Multi-clip: stride 10 dentro de cada clip de test (nunca cruzan).
+        if clip is not None:
+            w58 = []
+            for ci in [i for i in range(len(clip["bounds"])) if clip["bounds"][i, 0] >= va]:
+                lo, hi = int(clip["bounds"][ci, 0]), int(clip["bounds"][ci, 1])
+                w58.extend(range(lo + 10, hi - 130 + 1, 10))
+            w58 = sorted(set(w58))
+        else:
+            w58 = []
+            for i in range(58):
+                s = min(va + 10 + i * 10, n - 130)
+                if s not in w58:
+                    w58.append(s)
         nw = len(w58)
         per5 = [p1_for(model, arch, tq, tr, phase, period, [s], 5, **kw)[0] for s in w58]
         per24 = [p1_for(model, arch, tq, tr, phase, period, [s], 24, **kw)[0] for s in w58]
@@ -212,6 +232,7 @@ def main():
 def parse_args():
     p = argparse.ArgumentParser(description="Run 0 CPU: M1-M7 antes de gastar GPU")
     p.add_argument("--ckpt", action="append", required=True)
+    p.add_argument("--data", default="data/locomotion.npz")
     p.add_argument("--out", default=None)
     return p.parse_args()
 

@@ -45,6 +45,19 @@ def build_windows(targets, starts, steps):
     return true_win, prev_true
 
 
+def clip_valid_starts(clip_id, lo, hi, unroll, ahead=0):
+    """Starts cuya ventana [s-1, s+unroll-1+ahead] vive dentro de un clip.
+
+    Sin clip_id (npz v1) devuelve todo el rango (regimen intacto).
+    """
+    s = torch.arange(lo, hi)
+    if clip_id is None:
+        return s
+    cid = clip_id if torch.is_tensor(clip_id) else torch.from_numpy(np.asarray(clip_id))
+    far = (s + unroll - 1 + ahead).clamp(max=len(cid) - 1)
+    return s[(cid[s - 1] == cid[far])]
+
+
 def reparam_state(state, dq_std):
     """Reparam sin params (apuesta 3): [q0,q1,q2,rest] -> [q0,dq1,dq2,rest].
     dq1=(q0-q1)/std, dq2=(q1-q2)/std. Misma info, mejor condicionamiento:
@@ -105,10 +118,13 @@ def load_resume(path, model, optimizer, scheduler, root_net=None):
 
 def rollout_120f_metric(model, arch, tq_t, tr_np, phase_np, period, seeds,
                         stats_d, offsets_d, parents, inf_idx, sup_idx, dt,
-                        root_net=None, reparam=False, dq_std=None, delta_std=None):
+                        root_net=None, reparam=False, dq_std=None, delta_std=None,
+                        seed_lim=None, seed_per=None):
     """Rollout game-like 120f liviano para el log: mediana de pies (m) en seeds.
     Misma receta que eval_gates (historial propio, root con velocidad real,
-    fase determinista). Sin gradiente. Soporta root-net/reparam/delta-scale."""
+    fase determinista). Sin gradiente. Soporta root-net/reparam/delta-scale.
+    Multi-clip: seed_per[s] = periodo del clip propio; seed_lim[s] = ultimo
+    indice valido (la velocidad real no cruza de clip). Sin ellos, regimen v1."""
     rm, rs = stats_d["root_mean"], stats_d["root_std"]
     vm, vs = stats_d["vel_mean"], stats_d["vel_std"]
     fm, fs = stats_d["feet_mean"], stats_d["feet_std"]
@@ -116,12 +132,14 @@ def rollout_120f_metric(model, arch, tq_t, tr_np, phase_np, period, seeds,
     meds = []
     with torch.no_grad():
         for s in seeds:
+            per = (seed_per or {}).get(s, period)
+            lim = (seed_lim or {}).get(s, len(true_vel) - 1)
             hist = [tq_t[s].clone(), tq_t[s - 1].clone(), tq_t[s - 2].clone()]
             root = tr_np[s].copy()
             ph = float(phase_np[s + 3] % 1.0)
             qs, rs_ = [], []
             for _ in range(120):
-                vv = true_vel[min(s + len(qs), len(true_vel) - 1)]
+                vv = true_vel[min(s + len(qs), lim)]
                 root = root + vv * dt
                 root_t = torch.from_numpy(root).to(device=tq_t.device, dtype=torch.float32)
                 vel_t = torch.from_numpy(vv).to(device=tq_t.device, dtype=torch.float32)
@@ -153,7 +171,7 @@ def rollout_120f_metric(model, arch, tq_t, tr_np, phase_np, period, seeds,
                     nxt = hist[0] + dd
                     nxt = nxt / nxt.norm(dim=-1, keepdim=True).clamp_min(1e-4)
                 hist = [nxt, hist[0], hist[1]]
-                ph = (ph + 1.0 / period) % 1.0
+                ph = (ph + 1.0 / per) % 1.0
                 qs.append(nxt)
                 rs_.append(root.copy())
             q = torch.stack(qs)
@@ -336,6 +354,11 @@ def main():
     train_end, val_end = int(bundle["train_end"]), int(bundle["val_end"])
     frame_time = float(bundle["frame_time"])
     phase_period = float(bundle["phase_period"])
+    # Multi-clip (npz v2): clip_id por par + periodo por clip. Sin ellos (v1),
+    # todo es un solo clip y el regimen queda intacto.
+    clip_id = np.asarray(bundle["clip_id"]) if "clip_id" in bundle else None
+    clip_periods = np.asarray(bundle["phase_periods"], dtype=np.float64) if "phase_periods" in bundle else None
+    pair_periods = clip_periods[clip_id].astype(np.float32) if clip_id is not None else None
     inferior_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
     superior_idx = sorted(set(int(j) for j in bundle["superior_joints"]))
     root_mean = torch.from_numpy(bundle["root_mean"].astype(np.float32))
@@ -359,8 +382,9 @@ def main():
     offsets_t = torch.tensor(np.array(offsets), dtype=torch.float32)
 
     # Starts cronologicos (se necesita targets[starts-1] para el delta inicial).
-    train_starts = torch.arange(1, train_end - args.unroll + 1)
-    val_starts = torch.arange(train_end, val_end - args.unroll + 1)
+    # Multi-clip: la ventana [s-1, s+unroll) nunca cruza de clip.
+    train_starts = clip_valid_starts(clip_id, 1, train_end - args.unroll + 1, args.unroll)
+    val_starts = clip_valid_starts(clip_id, train_end, val_end - args.unroll + 1, args.unroll)
     train_loader = DataLoader(TensorDataset(train_starts), batch_size=args.batch, shuffle=True)
     val_state0 = inputs[val_starts]
     val_true, val_prev = build_windows(targets, val_starts, args.unroll)
@@ -462,8 +486,36 @@ def main():
                "vel_mean": vel_mean.to(dev), "vel_std": vel_std.to(dev),
                "feet_mean": feet_mean.to(dev), "feet_std": feet_std.to(dev)}
     n_targets = len(tq_all)
-    roll_seeds = [min(val_end + 10 + i * 80, n_targets - 130)
-                  for i in range(max(1, args.rollout_seeds))]
+    # Periodo por muestra (multi-clip) o escalar (v1). La fase avanza
+    # 1/periodo del clip propio; con v1 el tensor es el escalar de siempre.
+    if pair_periods is not None:
+        pp_all = torch.from_numpy(pair_periods)
+        def pp_of(starts_t):
+            return pp_all[starts_t].to(dev).unsqueeze(1)
+    else:
+        def pp_of(starts_t):
+            return phase_period
+    # Seeds del rollout-log dentro de clips de test con hueco para 120f.
+    if clip_id is not None:
+        bounds = np.asarray(bundle["clip_bounds"])
+        test_clips = [i for i in range(len(bounds))
+                      if bounds[i, 0] >= val_end and bounds[i, 1] - bounds[i, 0] >= 140]
+        roll_seeds, seed_lim, seed_per = [], {}, {}
+        per = max(1, args.rollout_seeds) // max(1, len(test_clips)) + 1
+        for ci in test_clips:
+            lo, hi = int(bounds[ci, 0]), int(bounds[ci, 1])
+            for s in np.linspace(lo + 10, hi - 130, num=min(per, 5)).astype(int):
+                if len(roll_seeds) >= max(1, args.rollout_seeds):
+                    break
+                roll_seeds.append(int(s))
+                seed_lim[int(s)] = hi - 1
+                seed_per[int(s)] = float(clip_periods[int(clip_id[lo])])
+            if len(roll_seeds) >= max(1, args.rollout_seeds):
+                break
+    else:
+        roll_seeds = [min(val_end + 10 + i * 80, n_targets - 130)
+                      for i in range(max(1, args.rollout_seeds))]
+        seed_lim, seed_per = {}, {}
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
@@ -488,7 +540,7 @@ def main():
                          off_d, parents,
                          inferior_idx, superior_idx, root_mean.to(dev), root_std.to(dev),
                          vel_mean.to(dev), vel_std.to(dev), feet_mean.to(dev), feet_std.to(dev),
-                         euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
+                         euler_min.to(dev), euler_max.to(dev), frame_time, pp_of(starts),
                          w_vel=args.w_vel, w_contact=args.w_contact,
                          w_foot=args.w_foot, w_limit=args.w_limit,
                          w_dvel=args.w_dvel,
@@ -551,7 +603,7 @@ def main():
                            off_d, parents,
                            inferior_idx, superior_idx, root_mean.to(dev), root_std.to(dev),
                            vel_mean.to(dev), vel_std.to(dev), feet_mean.to(dev), feet_std.to(dev),
-                           euler_min.to(dev), euler_max.to(dev), frame_time, phase_period,
+                           euler_min.to(dev), euler_max.to(dev), frame_time, pp_of(val_starts),
                            w_vel=args.w_vel, w_contact=args.w_contact,
                            w_foot=args.w_foot, w_limit=args.w_limit,
                            w_dvel=args.w_dvel,
@@ -603,7 +655,8 @@ def main():
                                                        inferior_idx, superior_idx,
                                                        frame_time, root_net=root_net,
                                                        reparam=use_reparam, dq_std=dq_std,
-                                                       delta_std=delta_std)
+                                                       delta_std=delta_std,
+                                                       seed_lim=seed_lim, seed_per=seed_per)
         tag = "" if do_val else " [sin val]"
         line = (f"epoch {epoch:3d} train {train_loss / len(train_loader):.6f} "
                 f"val_unroll {last['val']:.6f} (pose {last['pose']:.6f} "

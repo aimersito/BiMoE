@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, TensorDataset
 SRC = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(SRC))
 
-from train import build_windows, unroll  # noqa: E402
+from train import build_windows, unroll, clip_valid_starts  # noqa: E402
 from mono_model import MonoNet, MonoFiLM  # noqa: E402
 from preprocess import parse_bvh  # noqa: E402
 
@@ -58,7 +58,7 @@ def main():
          "foot": float(cfg.get("w_foot", 0.25)), "contact": float(cfg.get("w_contact", 0.25)),
          "limit": float(cfg.get("w_limit", 0.15))}
     print(f"pesos efectivos: {W}")
-    bundle = np.load(SRC.parent / "data" / "locomotion.npz")
+    bundle = np.load(SRC.parent / (a.data or "data/locomotion.npz"))
     inputs = torch.from_numpy(bundle["inputs"])
     targets = torch.from_numpy(bundle["targets"])
     train_end = int(bundle["train_end"])
@@ -77,10 +77,16 @@ def main():
     off = torch.tensor(np.array(offsets), dtype=torch.float32)
     inf_idx = sorted(set(int(j) for j in bundle["inferior_joints"]))
     sup_idx = sorted(set(int(j) for j in bundle["superior_joints"]))
-    starts = torch.arange(1, train_end - 8 + 1)
+    starts = clip_valid_starts(bundle["clip_id"] if "clip_id" in bundle else None,
+                             1, train_end - 8 + 1, 8)
     loader = DataLoader(TensorDataset(starts), batch_size=a.batch, shuffle=True)
     groups = trunk_groups(model)
     rows = {g: [] for g in groups}
+    if "clip_id" in bundle:
+        pp_audit = torch.from_numpy(
+            np.asarray(bundle["phase_periods"], dtype=np.float32)[np.asarray(bundle["clip_id"])])
+    else:
+        pp_audit = None
     nb, nskip = 0, 0
     for (sb,) in loader:
         if nb >= a.n_batches:
@@ -88,10 +94,11 @@ def main():
         true_win, prev_win = build_windows(targets, sb, 8)
         true_root_win = true_win[:, :, 92:95] * root_std + root_mean
         root_prev = root_mean + targets[sb - 1][:, 92:95] * root_std
+        pp = pp_audit[sb].unsqueeze(1) if pp_audit is not None else phase_period
         out = unroll(model, inputs[sb], root_prev, true_win, prev_win, true_root_win,
                      off, parents, inf_idx, sup_idx, root_mean, root_std,
                      vel_mean, vel_std, feet_mean, feet_std, euler_min, euler_max,
-                     frame_time, phase_period, w_vel=0.2, w_contact=W["contact"],
+                     frame_time, pp, w_vel=0.2, w_contact=W["contact"],
                      w_foot=W["foot"], w_limit=W["limit"], p_pred=0.5,
                      detach_carry=False, arch="mono")
         if out["contact"].item() == 0:
@@ -144,6 +151,7 @@ def main():
 def parse_args():
     p = argparse.ArgumentParser(description="Auditoria de gradientes por termino")
     p.add_argument("--ckpt", required=True)
+    p.add_argument("--data", default="data/locomotion.npz")
     p.add_argument("--n-batches", type=int, default=40)
     p.add_argument("--batch", type=int, default=256)
     return p.parse_args()
